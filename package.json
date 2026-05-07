@@ -1,0 +1,33 @@
+{
+  "name": "bid-bot",
+  "version": "1.0.0",
+  "description": "Marinade SAM auto-bid follower with local ds-sam runner",
+  "type": "module",
+  "main": "bid-bot.js",
+  "bin": {
+    "bid-bot": "./bid-bot.js"
+  },
+  "scripts": {
+    "start": "node bid-bot.js",
+    "setup": "node bid-bot.js --setup",
+    "status": "node bid-bot.js --status",
+    "dry-run": "node bid-bot.js --dry-run",
+    "loop": "node bid-bot.js --loop"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "marinade",
+    "solana",
+    "validator",
+    "bid",
+    "sam"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/1XP-AI/bid-bot.git"
+  },
+  "dependencies": {}
+}

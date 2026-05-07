@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Logs
+*.log
+logs/
+
+# Cache & output
+ds-sam/
+ds-sam-pipeline/
+ds-sam-cache/
+ds-sam-output/
+
+# State
+*.state
+
+# Local config (sensitive)
+validator-keypair.json
+*.keypair.json
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
