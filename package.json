@@ -12,7 +12,8 @@
     "setup": "node bid-bot.js --setup",
     "status": "node bid-bot.js --status",
     "dry-run": "node bid-bot.js --dry-run",
-    "loop": "node bid-bot.js --loop"
+    "loop": "node bid-bot.js --loop",
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=18.0.0"

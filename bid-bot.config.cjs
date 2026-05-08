@@ -1,6 +1,8 @@
 // bid-bot.config.js — pm2 ecosystem
 //
-// 동작: --loop 모드로 bid-bot.js 실행 → 내부 timer로 매 LOOP_INTERVAL초마다 1회 체크
+// 동작: --loop 모드로 bid-bot.js 실행 → 내부 timer로 반복 체크
+// 기본 주기는 bid-bot.json의 runtime.loopInterval을 따르고,
+// epoch-aware loop가 켜져 있으면 epoch 종료 임박 시 더 짧은 주기로 체크.
 // PM2는 프로세스를 항상 살려둠 (autorestart). 비정상 종료 시 5초 후 재시작.
 //
 // 사용법:
@@ -28,9 +30,9 @@ module.exports = {
               ':/home/' + (process.env.USER || 'mb') + '/.npm-global/bin',
 
         BID_BOT_CONFIG: './bid-bot.json',
-        LOOP_INTERVAL: '3600',                  // 3600초 = 60분마다 1회 체크
 
         // 임시 override (디버깅 용도)
+        // LOOP_INTERVAL: '3600',
         // DRY_RUN: 'true',
         // SAFETY_RATIO: '1.10',
       },

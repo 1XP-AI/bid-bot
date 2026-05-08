@@ -15,8 +15,12 @@ ds-sam-output/
 *.state
 
 # Local config (sensitive)
-validator-keypair.json
-*.keypair.json
+bid-bot.json
+*account.json
+*keypair.json
+*identity.json
+*key*.json
+keys/*
 
 # OS
 .DS_Store
