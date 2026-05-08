@@ -282,6 +282,7 @@ function pnpmEnv(extra = {}) {
   return {
     ...process.env,
     CI: process.env.CI || 'true',
+    COREPACK_ENABLE_AUTO_PIN: process.env.COREPACK_ENABLE_AUTO_PIN || '0',
     npm_config_engine_strict: 'false',
     npm_config_confirm_modules_purge: 'false',
     ...extra,
@@ -657,22 +658,51 @@ function readOnchainBond(bondAccount) {
   } catch { return null; }
 }
 
-function applyBid(bondAccount, newBid) {
+let validatorBondsForceSupport;
+function validatorBondsSupportsForce() {
+  if (validatorBondsForceSupport !== undefined) return validatorBondsForceSupport;
+  const r = spawnSync('validator-bonds', ['configure-bond', '--help'], {
+    timeout: BOND_CLI_TIMEOUT_MS,
+    encoding: 'utf8',
+  });
+  validatorBondsForceSupport = r.status === 0 && /(?:^|\s)--force(?:\s|,|$)/.test(`${r.stdout}\n${r.stderr}`);
+  return validatorBondsForceSupport;
+}
+
+function buildConfigureBondArgs(bondAccount, cpmpeLamports, opts = {}) {
+  const args = ['configure-bond', bondAccount,
+    '--authority', opts.authorityFile ?? AUTH_FILE,
+    '--cpmpe',     String(cpmpeLamports),
+    '-k',          opts.keypairFile ?? KEYPAIR_FILE,
+  ];
+  if (opts.force) args.push('--force');
+  return args;
+}
+
+function applyBid(bondAccount, newBid, currentBid) {
   const cpmpeLamports = pmpeToCpmpeLamports(newBid);
   if (cpmpeLamports == null) {
     log(`❌ bid 값이 숫자가 아니라 적용하지 않습니다. 값: ${newBid}`);
     return false;
   }
+  const forceDecrease = Number.isFinite(currentBid) && currentBid - newBid > Number.EPSILON;
+  const args = buildConfigureBondArgs(bondAccount, cpmpeLamports, {
+    force: forceDecrease,
+  });
   if (dryRunActive) {
-    log(`DRY_RUN입니다. 실제 트랜잭션은 보내지 않고 cpmpe=${cpmpeLamports} 적용 명령만 확인했습니다.`);
+    const forceText = forceDecrease ? ' bid 인하라 --force를 함께 사용합니다.' : '';
+    log(`DRY_RUN입니다. 실제 트랜잭션은 보내지 않고 cpmpe=${cpmpeLamports} 적용 명령만 확인했습니다.${forceText}`);
     return true;
   }
+  if (forceDecrease && !validatorBondsSupportsForce()) {
+    log('❌ 현재 validator-bonds CLI가 --force를 지원하지 않아 bid 인하를 적용할 수 없습니다. npm install -g @marinade.finance/validator-bonds-cli@latest 후 다시 실행하세요.');
+    return false;
+  }
+  if (forceDecrease) {
+    log('bid를 낮추는 변경이라 validator-bonds --force를 함께 사용합니다.');
+  }
   log(`on-chain bid 변경 트랜잭션을 보냅니다. 새 bid: ${fmtPmpe(newBid)}`);
-  const r = spawnSync('validator-bonds', ['configure-bond', bondAccount,
-    '--authority', AUTH_FILE,
-    '--cpmpe',     String(cpmpeLamports),
-    '-k',          KEYPAIR_FILE,
-  ], { stdio: 'inherit', timeout: BOND_CLI_TIMEOUT_MS });
+  const r = spawnSync('validator-bonds', args, { stdio: 'inherit', timeout: BOND_CLI_TIMEOUT_MS });
   if (timedOut(r)) log('❌ bid 변경 트랜잭션이 시간 안에 끝나지 않았습니다.');
   return r.status === 0;
 }
@@ -764,7 +794,7 @@ async function runOnce() {
     }));
   }
   log(`bid 변경이 필요합니다. ${fmtPmpe(onchain.bid)}에서 ${fmtPmpe(target)}로 조정합니다.`);
-  if (applyBid(bondAccount, target)) {
+  if (applyBid(bondAccount, target, onchain.bid)) {
     if (dryRunActive) return;
     await notifyDiscord(`✅ \`bid-bot\`: on-chain bid를 ${fmtPmpe(onchain.bid)}에서 ${fmtPmpe(target)}로 변경했습니다. epoch ${status.epoch}, 참여 bid ${fmtPmpe(status.effPart)}.`);
     writeFileSync(STATE_FILE, JSON.stringify({
@@ -776,6 +806,7 @@ async function runOnce() {
 }
 
 export {
+  buildConfigureBondArgs,
   calculateEpochTiming,
   capSingleDrop,
   chooseLoopDelayMs,

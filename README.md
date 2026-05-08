@@ -18,7 +18,7 @@ Marinade SAM 자동 bid 관리 봇. 로컬에서 ds-sam SDK를 직접 실행해 
 - `node` >= 18 (native fetch 필요)
 - `git`
 - `curl`
-- `validator-bonds` CLI (`npm install -g @marinade.finance/validator-bonds-cli`)
+- `validator-bonds` CLI 2.4.6 이상 (`npm install -g @marinade.finance/validator-bonds-cli@latest`)
 - Marinade config account keypair (`validator.authFile`, `validator.keypairFile`에 지정)
 
 `pnpm`은 자동으로 설치 시도합니다 (corepack / npm / standalone installer 순).
@@ -30,9 +30,10 @@ git clone https://github.com/1XP-AI/bid-bot.git
 cd bid-bot
 npm install        # (의존성 없음, package.json 메타데이터만)
 
-# validator-bonds CLI 설치
-npm install -g @marinade.finance/validator-bonds-cli
+# validator-bonds CLI 설치. bid 인하 적용에는 --force 지원 버전이 필요함.
+npm install -g @marinade.finance/validator-bonds-cli@latest
 validator-bonds --version
+validator-bonds configure-bond --help | grep -- --force
 
 # 로컬 설정 생성. bid-bot.json은 git에 올리지 않음
 cp bid-bot.example.json bid-bot.json
@@ -326,8 +327,9 @@ pm2 restart bid-bot
 
 **"validator-bonds CLI 필요"**
 ```bash
-npm install -g @marinade.finance/validator-bonds-cli
+npm install -g @marinade.finance/validator-bonds-cli@latest
 validator-bonds --version
+validator-bonds configure-bond --help | grep -- --force
 ```
 
 **"pnpm 자동 설치 실패"**

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  buildConfigureBondArgs,
   calculateEpochTiming,
   capSingleDrop,
   chooseLoopDelayMs,
@@ -293,4 +294,34 @@ test('formatDiscordContent prefixes alerts with the resolved validator name', ()
     '[Staking Fund] ✅ `bid-bot`: on-chain bid 변경 완료',
   );
   assert.equal(formatDiscordContent('plain message', ''), 'plain message');
+});
+
+test('configure-bond args add force only for explicit bid decreases', () => {
+  assert.deepEqual(
+    buildConfigureBondArgs('bond-a', 47_200_000, {
+      authorityFile: './auth.json',
+      keypairFile: './keypair.json',
+      force: true,
+    }),
+    [
+      'configure-bond', 'bond-a',
+      '--authority', './auth.json',
+      '--cpmpe', '47200000',
+      '-k', './keypair.json',
+      '--force',
+    ],
+  );
+  assert.deepEqual(
+    buildConfigureBondArgs('bond-a', 48_500_000, {
+      authorityFile: './auth.json',
+      keypairFile: './keypair.json',
+      force: false,
+    }),
+    [
+      'configure-bond', 'bond-a',
+      '--authority', './auth.json',
+      '--cpmpe', '48500000',
+      '-k', './keypair.json',
+    ],
+  );
 });
