@@ -12,6 +12,7 @@
 import {
   existsSync, readFileSync, writeFileSync, appendFileSync,
   statSync, mkdirSync, renameSync, copyFileSync,
+  accessSync, constants,
 } from 'fs';
 import { spawnSync } from 'child_process';
 import { resolve, dirname } from 'path';
@@ -189,8 +190,18 @@ async function notifyDiscord(content) {
 }
 
 function which(cmd) {
-  const r = spawnSync('command', ['-v', cmd], { shell: '/bin/bash' });
-  return r.status === 0;
+  const canExecute = (file) => {
+    try {
+      accessSync(file, constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (cmd.includes('/')) return canExecute(cmd);
+  return (process.env.PATH || '')
+    .split(':')
+    .some((dir) => canExecute(resolve(dir || '.', cmd)));
 }
 function timedOut(result) {
   return result.error?.code === 'ETIMEDOUT' || result.signal === 'SIGTERM';
