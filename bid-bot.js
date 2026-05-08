@@ -72,6 +72,7 @@ const DRY_RUN       = String(get('DRY_RUN',       'runtime.dryRun', false)).toLo
 const LOOP_INTERVAL = +get('LOOP_INTERVAL', 'runtime.loopInterval', 300) * 1000;
 const DSSAM_TIMEOUT_MS = +get('DSSAM_TIMEOUT_MS', 'runtime.dsSamTimeoutMs', 5 * 60 * 1000);
 const BOND_CLI_TIMEOUT_MS = +get('BOND_CLI_TIMEOUT_MS', 'runtime.bondCliTimeoutMs', 60 * 1000);
+const SETUP_COMMAND_TIMEOUT_MS = +get('SETUP_COMMAND_TIMEOUT_MS', 'runtime.setupCommandTimeoutMs', 15 * 60 * 1000);
 const SOLANA_RPC_URL = get('SOLANA_RPC_URL', 'runtime.epochAware.solanaRpcUrl', 'https://api.mainnet-beta.solana.com');
 const EPOCH_AWARE_LOOP = String(get('EPOCH_AWARE_LOOP', 'runtime.epochAware.enabled', true)).toLowerCase() === 'true';
 const EPOCH_FAST_THRESHOLD_SECONDS = +get('EPOCH_FAST_THRESHOLD_SECONDS', 'runtime.epochAware.thresholdSeconds', 3600);
@@ -278,6 +279,16 @@ function which(cmd) {
 function timedOut(result) {
   return result.error?.code === 'ETIMEDOUT' || result.signal === 'SIGTERM';
 }
+function spawnSetupCommand(cmd, args, opts = {}) {
+  const result = spawnSync(cmd, args, {
+    ...opts,
+    timeout: opts.timeout ?? SETUP_COMMAND_TIMEOUT_MS,
+  });
+  if (timedOut(result)) {
+    log(`❌ setup 명령이 시간 안에 끝나지 않았습니다. 명령: ${cmd} ${args.join(' ')}`);
+  }
+  return result;
+}
 function pnpmEnv(extra = {}) {
   return {
     ...process.env,
@@ -391,22 +402,22 @@ function ensurePnpm() {
   // 1. corepack (Node 16.10+ 내장, 권장)
   if (which('corepack')) {
     log('corepack으로 pnpm을 준비합니다.');
-    spawnSync('corepack', ['enable'], { stdio: 'inherit' });
-    spawnSync('corepack', ['prepare', 'pnpm@latest', '--activate'], { stdio: 'inherit' });
+    spawnSetupCommand('corepack', ['enable'], { stdio: 'inherit' });
+    spawnSetupCommand('corepack', ['prepare', 'pnpm@latest', '--activate'], { stdio: 'inherit' });
     if (which('pnpm')) { log('pnpm 설치가 끝났습니다. 설치 방식: corepack'); return; }
   }
 
   // 2. npm install -g
   if (which('npm')) {
     log('npm으로 pnpm 전역 설치를 시도합니다.');
-    const r = spawnSync('npm', ['install', '-g', 'pnpm'], { stdio: 'inherit' });
+    const r = spawnSetupCommand('npm', ['install', '-g', 'pnpm'], { stdio: 'inherit' });
     if (r.status === 0 && which('pnpm')) { log('pnpm 설치가 끝났습니다. 설치 방식: npm'); return; }
   }
 
   // 3. standalone
   if (which('curl')) {
     log('pnpm standalone installer를 시도합니다.');
-    const r = spawnSync('sh', ['-c', 'curl -fsSL https://get.pnpm.io/install.sh | sh -'], { stdio: 'inherit' });
+    const r = spawnSetupCommand('sh', ['-c', 'curl -fsSL https://get.pnpm.io/install.sh | sh -'], { stdio: 'inherit' });
     if (r.status === 0) {
       process.env.PATH = `${process.env.HOME}/.local/share/pnpm:${process.env.PATH}`;
       if (which('pnpm')) { log('pnpm 설치가 끝났습니다. 설치 방식: standalone installer'); return; }
@@ -450,24 +461,24 @@ function ensureDsSamReady() {
 
   if (!existsSync(DSSAM_DIR)) {
     log(`ds-sam 저장소를 받습니다. 위치: ${DSSAM_DIR}`);
-    if (spawnSync('git', ['clone', 'https://github.com/marinade-finance/ds-sam.git', DSSAM_DIR],
+    if (spawnSetupCommand('git', ['clone', 'https://github.com/marinade-finance/ds-sam.git', DSSAM_DIR],
                   { stdio: 'inherit' }).status !== 0) die('clone 실패');
   }
   if (!existsSync(PIPELINE_DIR)) {
     log(`ds-sam-pipeline 저장소를 받습니다. 위치: ${PIPELINE_DIR}`);
-    if (spawnSync('git', ['clone', 'https://github.com/marinade-finance/ds-sam-pipeline.git', PIPELINE_DIR],
+    if (spawnSetupCommand('git', ['clone', 'https://github.com/marinade-finance/ds-sam-pipeline.git', PIPELINE_DIR],
                   { stdio: 'inherit' }).status !== 0) die('clone 실패');
   }
 
   if (!existsSync(`${DSSAM_DIR}/node_modules`)) {
     log('ds-sam 의존성을 설치합니다. 보통 5~10분 걸립니다.');
-    if (spawnSync('pnpm', ['install', '--frozen-lockfile', '--config.engine-strict=false', '--ignore-scripts'],
+    if (spawnSetupCommand('pnpm', ['install', '--frozen-lockfile', '--config.engine-strict=false', '--ignore-scripts'],
                   { cwd: DSSAM_DIR, stdio: 'inherit', env: pnpmEnv() }).status !== 0)
       die('pnpm install 실패');
   }
   if (!buildReady) {
     log('ds-sam을 빌드합니다.');
-    if (spawnSync('pnpm', ['--config.verify-deps-before-run=false', '-r', 'build'],
+    if (spawnSetupCommand('pnpm', ['--config.verify-deps-before-run=false', '-r', 'build'],
                   { cwd: DSSAM_DIR, stdio: 'inherit', env: pnpmEnv() }).status !== 0)
       die('build 실패');
   }
@@ -754,11 +765,19 @@ async function runOnce() {
   }
 
   const bondAccount = resolveBondAccount();
-  if (!bondAccount) { log('❌ bond account를 찾지 못해 on-chain 상태를 확인할 수 없습니다.'); return; }
+  if (!bondAccount) {
+    log('❌ bond account를 찾지 못해 on-chain 상태를 확인할 수 없습니다.');
+    await notifyDiscord('❌ `bid-bot`: bond account 조회에 실패해 이번 회차를 중단했습니다.');
+    return;
+  }
   logVerbose(`bond account를 확인했습니다. account: ${fmtAccount(bondAccount)}`);
 
   const onchain = readOnchainBond(bondAccount);
-  if (!onchain) { log('❌ on-chain bond 상태를 읽지 못해 bid를 변경하지 않습니다.'); return; }
+  if (!onchain) {
+    log('❌ on-chain bond 상태를 읽지 못해 bid를 변경하지 않습니다.');
+    await notifyDiscord('❌ `bid-bot`: on-chain bond 상태 조회에 실패해 이번 회차를 중단했습니다.');
+    return;
+  }
   logVerbose(`현재 on-chain bid는 ${fmtPmpe(onchain.bid)}입니다.`);
 
   const delta = Math.abs(onchain.bid - target);

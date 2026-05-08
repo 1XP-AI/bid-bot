@@ -264,7 +264,11 @@ BID_BOT_CONFIG=/path/to/my-bid-bot.json node bid-bot.js --dry-run
 
     // validator-bonds CLI 호출이 이 시간 안에 끝나지 않으면 중단.
     // 밀리초 단위. 60000 = 1분.
-    "bondCliTimeoutMs": 60000
+    "bondCliTimeoutMs": 60000,
+
+    // ds-sam clone/install/build 같은 setup 명령이 이 시간 안에 끝나지 않으면 중단.
+    // 밀리초 단위. 900000 = 15분.
+    "setupCommandTimeoutMs": 900000
   }
 }
 ```

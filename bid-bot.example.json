@@ -47,6 +47,7 @@
       "rpcTimeoutMs": 10000
     },
     "dsSamTimeoutMs": 300000,
-    "bondCliTimeoutMs": 60000
+    "bondCliTimeoutMs": 60000,
+    "setupCommandTimeoutMs": 900000
   }
 }
