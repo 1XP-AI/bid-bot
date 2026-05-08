@@ -90,6 +90,7 @@ const FORCE_REFRESH = args.includes('--force-refresh');
 const FORCE_DRY     = args.includes('--dry-run');
 const dryRunActive  = DRY_RUN || FORCE_DRY;
 const verboseLogs   = dryRunActive;
+const showCalculationTable = dryRunActive || MODE === 'loop';
 let discordValidatorLabel = '';
 
 // ============================================================
@@ -780,15 +781,15 @@ async function runOnce() {
   }
   logVerbose(`현재 on-chain bid는 ${fmtPmpe(onchain.bid)}입니다.`);
 
-  const delta = Math.abs(onchain.bid - target);
-  if (verboseLogs) {
-    log(formatBidCalculationTable(status, onchain.bid, target, {
-      includeMinChange: true,
-    }));
-  }
-
   if (!shouldChangeBid(onchain.bid, target)) {
-    logVerbose(`변경 기준(${fmtPmpe(MIN_BID_CHANGE_PMPE)})보다 차이가 작아서 이번에는 bid를 유지합니다.`);
+    if (showCalculationTable) {
+      log(formatBidCalculationTable(status, onchain.bid, target, {
+        includeMinChange: dryRunActive,
+      }));
+      log(`변경 기준(${fmtPmpe(MIN_BID_CHANGE_PMPE)})보다 차이가 작아서 이번에는 bid를 유지합니다.`);
+    } else {
+      logVerbose(`변경 기준(${fmtPmpe(MIN_BID_CHANGE_PMPE)})보다 차이가 작아서 이번에는 bid를 유지합니다.`);
+    }
     if (status.bidTooLowPenalty > 0) {
       log(`⚠️ bid-too-low 페널티가 발생 중입니다. 현재 페널티: ${fmtPenalty(status.bidTooLowPenalty)}`);
       await notifyDiscord(`⚠️ \`bid-bot\`: bid-too-low 페널티가 발생 중입니다. 현재 페널티: ${fmtPenalty(status.bidTooLowPenalty)}. 수동 점검이 필요합니다.`);
@@ -807,7 +808,12 @@ async function runOnce() {
     }
   }
 
-  if (!verboseLogs) {
+  if (showCalculationTable) {
+    log(formatBidCalculationTable(status, onchain.bid, target, {
+      includeMinChange: dryRunActive,
+      title: MODE === 'loop' ? '계산 결과' : undefined,
+    }));
+  } else {
     log(formatBidCalculationTable(status, onchain.bid, target, {
       title: 'bid 변경 계산',
     }));
@@ -879,9 +885,17 @@ async function main() {
     if (EPOCH_AWARE_LOOP) {
       log(`epoch-aware loop가 켜져 있습니다. Solana epoch 종료가 ${fmtDuration(EPOCH_FAST_THRESHOLD_SECONDS)} 이내로 다가오면 최대 ${fmtDuration(EPOCH_FAST_INTERVAL / 1000)}마다 확인합니다.`);
     }
+    let firstLoopRun = true;
     while (true) {
+      if (firstLoopRun) {
+        log('첫 회차 확인을 바로 시작합니다. 매 회차 계산표를 표시합니다.');
+      }
       try { await runOnce(); } catch (e) { log(`예상하지 못한 오류가 발생했습니다. 다음 회차에서 다시 시도합니다. ${e.stack || e.message}`); }
       const delayMs = await nextLoopDelayMs();
+      if (firstLoopRun) {
+        log(`첫 회차 확인이 끝났습니다. 다음 확인은 ${fmtDuration(delayMs / 1000)} 후입니다.`);
+        firstLoopRun = false;
+      }
       await new Promise(r => setTimeout(r, delayMs));
     }
   } else {
