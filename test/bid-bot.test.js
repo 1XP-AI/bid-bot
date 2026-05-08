@@ -7,6 +7,8 @@ import {
   chooseLoopDelayMs,
   computeTargetBid,
   extractMyStatusFromResults,
+  findValidatorNameByVoteAccount,
+  formatDiscordContent,
   formatBidCalculationTable,
   fmtDuration,
   isTargetInSanityRange,
@@ -265,4 +267,30 @@ test('refreshHeavyFiles reports failed heavy inputs before calculation can conti
     { url: 'https://example.invalid/rewards', dest: '/tmp/bid-bot-cache/rewards.json' },
     { url: 'https://example.invalid/auctions', dest: '/tmp/bid-bot-cache/auctions.json' },
   ]);
+});
+
+test('findValidatorNameByVoteAccount reads Marinade validator names by vote account', () => {
+  const data = {
+    validators: [
+      {
+        vote_account: 'vote-a',
+        info_name: '  Staking   Fund  ',
+      },
+      {
+        vote_account: 'vote-b',
+        info_name: 'Other Validator',
+      },
+    ],
+  };
+
+  assert.equal(findValidatorNameByVoteAccount(data, 'vote-a'), 'Staking Fund');
+  assert.equal(findValidatorNameByVoteAccount(data, 'missing-vote'), null);
+});
+
+test('formatDiscordContent prefixes alerts with the resolved validator name', () => {
+  assert.equal(
+    formatDiscordContent('✅ `bid-bot`: on-chain bid 변경 완료', 'Staking Fund'),
+    '[Staking Fund] ✅ `bid-bot`: on-chain bid 변경 완료',
+  );
+  assert.equal(formatDiscordContent('plain message', ''), 'plain message');
 });

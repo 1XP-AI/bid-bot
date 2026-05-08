@@ -77,6 +77,8 @@ const EPOCH_AWARE_LOOP = String(get('EPOCH_AWARE_LOOP', 'runtime.epochAware.enab
 const EPOCH_FAST_THRESHOLD_SECONDS = +get('EPOCH_FAST_THRESHOLD_SECONDS', 'runtime.epochAware.thresholdSeconds', 3600);
 const EPOCH_FAST_INTERVAL = +get('EPOCH_FAST_INTERVAL_SECONDS', 'runtime.epochAware.fastLoopIntervalSeconds', 300) * 1000;
 const EPOCH_RPC_TIMEOUT_MS = +get('EPOCH_RPC_TIMEOUT_MS', 'runtime.epochAware.rpcTimeoutMs', 10000);
+const VALIDATOR_NAME_LOOKUP_URL = 'https://validators-api.marinade.finance/validators?epochs=1&limit=1000000';
+const VALIDATOR_NAME_TIMEOUT_MS = +get('VALIDATOR_NAME_TIMEOUT_MS', 'runtime.validatorNameTimeoutMs', 10000);
 
 const args = process.argv.slice(2);
 const MODE = args.includes('--setup')  ? 'setup'
@@ -87,6 +89,7 @@ const FORCE_REFRESH = args.includes('--force-refresh');
 const FORCE_DRY     = args.includes('--dry-run');
 const dryRunActive  = DRY_RUN || FORCE_DRY;
 const verboseLogs   = dryRunActive;
+let discordValidatorLabel = '';
 
 // ============================================================
 // 유틸
@@ -178,13 +181,82 @@ function parseCpmpeBid(value) {
   return Number.isFinite(bid) ? bid : null;
 }
 
+function cleanValidatorName(name) {
+  const text = String(name ?? '').trim().replace(/\s+/g, ' ');
+  return text || null;
+}
+
+function findValidatorNameByVoteAccount(data, voteAccount) {
+  if (!voteAccount || !data) return null;
+  const lists = [
+    Array.isArray(data) ? data : null,
+    Array.isArray(data.validators) ? data.validators : null,
+    Array.isArray(data.validators_aggregated) ? data.validators_aggregated : null,
+    Array.isArray(data.auctionData?.validators) ? data.auctionData.validators : null,
+  ].filter(Boolean);
+  const voteFields = ['vote_account', 'voteAccount', 'vote_account_address', 'votePubkey'];
+  const nameFields = ['info_name', 'name', 'moniker', 'validatorName', 'validator_name'];
+
+  for (const validators of lists) {
+    for (const validator of validators) {
+      if (!voteFields.some((field) => validator?.[field] === voteAccount)) continue;
+      for (const field of nameFields) {
+        const name = cleanValidatorName(validator?.[field]);
+        if (name) return name;
+      }
+    }
+  }
+  return null;
+}
+
+function formatDiscordContent(content, validatorName = discordValidatorLabel) {
+  const label = cleanValidatorName(validatorName);
+  return label ? `[${label}] ${content}` : content;
+}
+
+function readCachedValidatorName(voteAccount) {
+  const file = `${CACHE_DIR}/validators.json`;
+  if (!existsSync(file)) return null;
+  try {
+    return findValidatorNameByVoteAccount(JSON.parse(readFileSync(file, 'utf8')), voteAccount);
+  } catch {
+    return null;
+  }
+}
+
+async function fetchValidatorName(voteAccount) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), VALIDATOR_NAME_TIMEOUT_MS);
+  try {
+    const resp = await fetch(VALIDATOR_NAME_LOOKUP_URL, { signal: ctrl.signal });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    return findValidatorNameByVoteAccount(await resp.json(), voteAccount);
+  } catch (e) {
+    logVerbose(`validator 이름 조회에 실패했습니다. 이유: ${e.message}`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function initDiscordValidatorLabel() {
+  if (!VOTE_ADDR) return;
+  const name = readCachedValidatorName(VOTE_ADDR) ?? await fetchValidatorName(VOTE_ADDR);
+  discordValidatorLabel = name ?? fmtAccount(VOTE_ADDR);
+  if (name) {
+    logVerbose(`validator 이름을 확인했습니다. name: ${name}`);
+  } else {
+    logVerbose(`validator 이름을 찾지 못해 Discord prefix는 ${discordValidatorLabel}로 표시합니다.`);
+  }
+}
+
 async function notifyDiscord(content) {
   if (!DISCORD_WEBHOOK) return;
   try {
     await fetch(DISCORD_WEBHOOK, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({ content: formatDiscordContent(content) }),
     });
   } catch (e) { log(`Discord 알림을 보내지 못했습니다. 이유: ${e.message}`); }
 }
@@ -709,6 +781,8 @@ export {
   chooseLoopDelayMs,
   computeTargetBid,
   extractMyStatusFromResults,
+  findValidatorNameByVoteAccount,
+  formatDiscordContent,
   formatBidCalculationTable,
   fmtDuration,
   isTargetInSanityRange,
@@ -742,12 +816,14 @@ async function checkPrereqs() {
 
 async function main() {
   if (MODE === 'setup') {
+    await initDiscordValidatorLabel();
     ensurePnpm();
     ensureDsSamReady();
     log('setup이 끝났습니다. 이제 --dry-run으로 실제 계산 흐름을 확인할 수 있습니다.');
     return;
   }
   await checkPrereqs();
+  await initDiscordValidatorLabel();
   if (MODE === 'loop') {
     log(`상시 실행 모드로 시작합니다. 기본 확인 주기는 ${fmtDuration(LOOP_INTERVAL / 1000)}입니다.`);
     if (EPOCH_AWARE_LOOP) {
