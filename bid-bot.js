@@ -63,6 +63,9 @@ const MIN_BID_CHANGE_PMPE = +get('MIN_BID_CHANGE_PMPE', 'bidStrategy.minBidChang
 const MIN_SANITY_BID      = +get('MIN_SANITY_BID',      'bidStrategy.minSanityBid',      0.005);
 const MAX_SANITY_BID      = +get('MAX_SANITY_BID',      'bidStrategy.maxSanityBid',      0.20);
 const MAX_SINGLE_DROP     = +get('MAX_SINGLE_DROP',     'bidStrategy.maxSingleDrop',     0.02);
+// bid-too-low 페널티 방지: 최근 N 에폭 동안의 내 bidPmpe 최소값 × multiplier를 floor로 사용
+const RECENT_MIN_LOOKBACK_EPOCHS = +get('RECENT_MIN_LOOKBACK_EPOCHS', 'bidStrategy.recentMinLookbackEpochs', 4);
+const RECENT_MIN_MULTIPLIER      = +get('RECENT_MIN_MULTIPLIER',      'bidStrategy.recentMinMultiplier',     1.03);
 
 const LOG_FILE        = rel(get('LOG_FILE',   'logging.logFile',   './bid-bot.log'));
 const STATE_FILE      = rel(get('STATE_FILE', 'logging.stateFile', './bid-bot.state'));
@@ -165,8 +168,11 @@ function formatBidCalculationTable(status, onchainBid, targetBid, opts = {}) {
     ['Penalty', fmtPenalty(status.bidTooLowPenalty)],
     ['SAM Target', fmtSol(status.samTargetSol)],
   ];
+  if (Number.isFinite(opts.recentMinFloor) && opts.recentMinFloor > 0) {
+    rows.splice(8, 0, [`Recent${RECENT_MIN_LOOKBACK_EPOCHS}MinFloor`, fmtPmpe(opts.recentMinFloor)]);
+  }
   if (opts.includeMinChange) {
-    rows.splice(10, 0, ['Min Change', fmtPmpe(MIN_BID_CHANGE_PMPE)]);
+    rows.splice(rows.findIndex(r => r[0] === 'Delta'), 0, ['Min Change', fmtPmpe(MIN_BID_CHANGE_PMPE)]);
   }
   return formatTable(opts.title ?? '계산 결과', rows);
 }
@@ -607,10 +613,42 @@ function computeTargetBid(effPart, strategy = {}) {
   const permittedDev = strategy.permittedDev ?? PERMITTED_DEV;
   const winBufferPmpe = strategy.winBufferPmpe ?? WIN_BUFFER_PMPE;
   const safetyRatio = strategy.safetyRatio ?? SAFETY_RATIO;
+  const recentMinFloor = strategy.recentMinFloor ?? 0;
   const safeFloor    = effPart * (1 - permittedDev);
   const winningFloor = effPart + winBufferPmpe;
   const conservative = effPart * safetyRatio;
-  return +Math.max(safeFloor, winningFloor, conservative).toFixed(4);
+  return +Math.max(safeFloor, winningFloor, conservative, recentMinFloor).toFixed(4);
+}
+
+// scoring.marinade.finance SAM API 응답에서 내 validator의 epoch별 effParticipatingBidPmpe를 추출
+function extractMyEffBidsFromAuctions(auctions, voteAccount) {
+  if (!Array.isArray(auctions)) return [];
+  return auctions
+    .filter(a => a?.voteAccount === voteAccount)
+    .map(a => ({
+      epoch: a.epoch,
+      effPart: a.revShare?.effParticipatingBidPmpe,
+      bidPmpe: a.revShare?.bidPmpe,
+    }))
+    .filter(e => Number.isFinite(e.epoch) && Number.isFinite(e.effPart) && e.effPart > 0)
+    .sort((a, b) => a.epoch - b.epoch);
+}
+
+function computeRecentMinFloor(auctions, voteAccount, currentEpoch) {
+  const mine = extractMyEffBidsFromAuctions(auctions, voteAccount);
+  if (mine.length === 0) return 0;
+  // 현재 epoch은 제외하고 직전 N 에폭의 effParticipatingBidPmpe 최소값 사용
+  const past = mine.filter(e => e.epoch !== currentEpoch).slice(-RECENT_MIN_LOOKBACK_EPOCHS);
+  if (past.length === 0) return 0;
+  const minEff = Math.min(...past.map(e => e.effPart));
+  return minEff * RECENT_MIN_MULTIPLIER;
+}
+
+function readCachedAuctions() {
+  const f = `${CACHE_DIR}/auctions.json`;
+  if (!existsSync(f)) return null;
+  try { return JSON.parse(readFileSync(f, 'utf8')); }
+  catch { return null; }
 }
 
 function shouldChangeBid(onchainBid, targetBid, minBidChangePmpe = MIN_BID_CHANGE_PMPE) {
@@ -753,13 +791,19 @@ async function runOnce() {
     return;
   }
 
+  // samEligible 체크는 비활성화되었습니다 (사용자 요청).
   if (!status.samEligible) {
-    log('⚠️ 현재 validator가 SAM 입찰 대상이 아닙니다. bid는 변경하지 않고 eligibility를 점검해야 합니다.');
-    await notifyDiscord('⚠️ `bid-bot`: 현재 validator가 SAM 입찰 대상이 아닙니다. eligibility 점검이 필요합니다.');
-    return;
+    log('ℹ️ samEligible=false 이지만 체크를 건너뛰고 진행합니다.');
   }
 
-  let target = computeTargetBid(status.effPart);
+  // bid-too-low 페널티 방지: SAM API(auctions.json)의 내 effParticipatingBidPmpe 최근 N 에폭 min × 1.03을 floor로 사용
+  const auctions = readCachedAuctions();
+  const recentMinFloor = computeRecentMinFloor(auctions, VOTE_ADDR, status.epoch);
+  if (recentMinFloor > 0) {
+    logVerbose(`최근 ${RECENT_MIN_LOOKBACK_EPOCHS} 에폭 내 effParticipatingBidPmpe 최소값 × ${RECENT_MIN_MULTIPLIER} = ${fmtPmpe(recentMinFloor)}를 floor로 적용합니다.`);
+  }
+
+  let target = computeTargetBid(status.effPart, { recentMinFloor });
   if (!isTargetInSanityRange(target)) {
     log(`⚠️ 계산된 목표 bid ${fmtPmpe(target)}가 안전 범위(${fmtPmpe(MIN_SANITY_BID)}~${fmtPmpe(MAX_SANITY_BID)}) 밖이라 변경하지 않습니다.`);
     return;
@@ -785,6 +829,7 @@ async function runOnce() {
     if (showCalculationTable) {
       log(formatBidCalculationTable(status, onchain.bid, target, {
         includeMinChange: dryRunActive,
+        recentMinFloor,
       }));
       log(`변경 기준(${fmtPmpe(MIN_BID_CHANGE_PMPE)})보다 차이가 작아서 이번에는 bid를 유지합니다.`);
     } else {
@@ -811,10 +856,12 @@ async function runOnce() {
   if (showCalculationTable) {
     log(formatBidCalculationTable(status, onchain.bid, target, {
       includeMinChange: dryRunActive,
+      recentMinFloor,
       title: MODE === 'loop' ? '계산 결과' : undefined,
     }));
   } else {
     log(formatBidCalculationTable(status, onchain.bid, target, {
+      recentMinFloor,
       title: 'bid 변경 계산',
     }));
   }
@@ -835,7 +882,9 @@ export {
   calculateEpochTiming,
   capSingleDrop,
   chooseLoopDelayMs,
+  computeRecentMinFloor,
   computeTargetBid,
+  extractMyEffBidsFromAuctions,
   extractMyStatusFromResults,
   findValidatorNameByVoteAccount,
   formatDiscordContent,
