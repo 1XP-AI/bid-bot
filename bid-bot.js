@@ -306,6 +306,32 @@ function pnpmEnv(extra = {}) {
     ...extra,
   };
 }
+function patchDsSamSdkForPrereleaseVersions(source) {
+  const target = 'semver.satisfies(validator.clientVersion, this.config.validatorsClientVersionSemverExpr)';
+  const replacement = 'semver.satisfies(validator.clientVersion, this.config.validatorsClientVersionSemverExpr, { includePrerelease: true })';
+  if (source.includes(replacement)) return { source, patched: false, alreadyPatched: true };
+  if (!source.includes(target)) return { source, patched: false, alreadyPatched: false };
+  return {
+    source: source.replace(target, replacement),
+    patched: true,
+    alreadyPatched: false,
+  };
+}
+function applyDsSamCompatibilityPatches() {
+  const sdkPath = `${DSSAM_DIR}/packages/ds-sam-sdk/src/sdk.ts`;
+  if (!existsSync(sdkPath)) return false;
+  const original = readFileSync(sdkPath, 'utf8');
+  const result = patchDsSamSdkForPrereleaseVersions(original);
+  if (!result.patched) {
+    if (!result.alreadyPatched) {
+      log('⚠️ ds-sam client version 체크 패치를 적용하지 못했습니다. Firedancer rc 버전이 SAM eligibility에서 제외될 수 있습니다.');
+    }
+    return false;
+  }
+  writeFileSync(sdkPath, result.source);
+  log('ds-sam client version 체크를 Firedancer rc 버전까지 허용하도록 패치했습니다.');
+  return true;
+}
 function freshWithin(file, seconds) {
   if (!existsSync(file)) return false;
   return (Date.now() - statSync(file).mtimeMs) / 1000 <= seconds;
@@ -461,10 +487,10 @@ function ensureDsSamReady() {
   }
   ensurePnpm();
 
-  if (!need) return;
-
-  log('ds-sam 실행 환경이 아직 준비되지 않아 자동 setup을 시작합니다.');
-  notifyDiscord('🔧 `bid-bot`: ds-sam 자동 설치 시작 (5~10분)');
+  if (need) {
+    log('ds-sam 실행 환경이 아직 준비되지 않아 자동 setup을 시작합니다.');
+    notifyDiscord('🔧 `bid-bot`: ds-sam 자동 설치 시작 (5~10분)');
+  }
 
   if (!existsSync(DSSAM_DIR)) {
     log(`ds-sam 저장소를 받습니다. 위치: ${DSSAM_DIR}`);
@@ -483,14 +509,16 @@ function ensureDsSamReady() {
                   { cwd: DSSAM_DIR, stdio: 'inherit', env: pnpmEnv() }).status !== 0)
       die('pnpm install 실패');
   }
-  if (!buildReady) {
+  const patched = applyDsSamCompatibilityPatches();
+  if (!need && !patched) return;
+  if (!buildReady || patched) {
     log('ds-sam을 빌드합니다.');
     if (spawnSetupCommand('pnpm', ['--config.verify-deps-before-run=false', '-r', 'build'],
                   { cwd: DSSAM_DIR, stdio: 'inherit', env: pnpmEnv() }).status !== 0)
       die('build 실패');
   }
 
-  notifyDiscord('✅ `bid-bot`: ds-sam 설치 완료');
+  notifyDiscord(`✅ \`bid-bot\`: ds-sam ${need ? '설치' : '패치'} 완료`);
 }
 
 // ============================================================
@@ -695,17 +723,30 @@ function readOnchainBond(bondAccount) {
     log('❌ on-chain bond 상태 조회가 시간 안에 끝나지 않았습니다.');
     return null;
   }
-  if (r.status !== 0) return null;
+  if (r.status !== 0) {
+    const output = `${r.stderr || ''}\n${r.stdout || ''}`.trim();
+    log(`❌ on-chain bond 상태 조회 실패. validator-bonds 출력: ${output.slice(-800) || `exit ${r.status}`}`);
+    return null;
+  }
   const m = r.stdout.toString().match(/\{[\s\S]*\}/);
-  if (!m) return null;
+  if (!m) {
+    log('❌ on-chain bond 상태 조회 결과에서 JSON을 찾지 못했습니다.');
+    return null;
+  }
   try {
     const j = JSON.parse(m[0]);
     const bid = parseCpmpeBid(j.account?.costPerMillePerEpoch);
-    if (bid == null) return null;
+    if (bid == null) {
+      log('❌ on-chain bond 상태에서 costPerMillePerEpoch 값을 읽지 못했습니다.');
+      return null;
+    }
     return {
       bid,
     };
-  } catch { return null; }
+  } catch (e) {
+    log(`❌ on-chain bond JSON 파싱 실패: ${e.message}`);
+    return null;
+  }
 }
 
 let validatorBondsForceSupport;
@@ -892,6 +933,7 @@ export {
   fmtDuration,
   isTargetInSanityRange,
   parseCpmpeBid,
+  patchDsSamSdkForPrereleaseVersions,
   pmpeToCpmpeLamports,
   refreshHeavyFiles,
   shouldChangeBid,

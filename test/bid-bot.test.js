@@ -14,6 +14,7 @@ import {
   fmtDuration,
   isTargetInSanityRange,
   parseCpmpeBid,
+  patchDsSamSdkForPrereleaseVersions,
   pmpeToCpmpeLamports,
   refreshHeavyFiles,
   shouldChangeBid,
@@ -324,4 +325,18 @@ test('configure-bond args add force only for explicit bid decreases', () => {
       '-k', './keypair.json',
     ],
   );
+});
+
+test('ds-sam patch allows prerelease client versions in semver checks', () => {
+  const before = 'if (!semver.satisfies(validator.clientVersion, this.config.validatorsClientVersionSemverExpr)) return false';
+  const result = patchDsSamSdkForPrereleaseVersions(before);
+
+  assert.equal(result.patched, true);
+  assert.equal(result.alreadyPatched, false);
+  assert.match(result.source, /includePrerelease: true/);
+
+  const second = patchDsSamSdkForPrereleaseVersions(result.source);
+  assert.equal(second.patched, false);
+  assert.equal(second.alreadyPatched, true);
+  assert.equal(second.source, result.source);
 });

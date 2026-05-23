@@ -351,15 +351,21 @@ pnpm -r build
 ```
 
 **"validator가 결과에 없음"**
-- samEligible 체크: uptime, commission, blacklist 확인
+- vote account가 Marinade validator 목록에 있는지 먼저 확인
+- uptime, commission, blacklist, client version 조건 확인
 - PSR 대시보드에서 validator 직접 확인
+
+**"samEligible=false가 나오는데 입찰 대상이 맞음"**
+- Firedancer rc 버전처럼 `0.909.0-rc...` 형태의 prerelease client version은 원본 ds-sam semver 체크에서 제외될 수 있습니다.
+- bid-bot은 setup/run 시 ds-sam SDK를 자동 패치해서 prerelease 버전도 허용합니다.
+- 이미 실행 중인 프로세스가 예전 로그(`현재 validator가 SAM 입찰 대상이 아닙니다`)를 계속 찍으면 최신 코드를 pull한 뒤 PM2/loop를 재시작하세요.
 
 ## 안전장치
 
 1. **3중 floor**: penalty/winning/safety 동시 만족
 2. **MIN_SANITY_BID, MAX_SANITY_BID**: 비정상 값 차단
 3. **MAX_SINGLE_DROP**: 큰 폭 인하 방지 (단계적)
-4. **samEligible 체크**: 자격 미달 시 변경 안 함
+4. **stale cache 차단**: live/heavy 데이터 갱신 실패 시 오래된 입력으로 적용하지 않음
 5. **DRY_RUN 모드**: 며칠 시뮬레이션 후 실전
 6. **MIN_BID_CHANGE_PMPE**: 미세 변동 무시 (불필요한 tx 방지)
 
