@@ -6,11 +6,13 @@ import {
   calculateEpochTiming,
   capSingleDrop,
   chooseLoopDelayMs,
+  computeFillRankRowsFromResults,
   computeTargetBid,
   extractMyStatusFromResults,
   findValidatorNameByVoteAccount,
   formatDiscordContent,
   formatBidCalculationTable,
+  formatFillRankTable,
   fmtDuration,
   isTargetInSanityRange,
   parseCpmpeBid,
@@ -248,6 +250,71 @@ test('dry-run bid table can include the fixed min-change threshold explicitly', 
   });
 
   assert.match(table, /Min Change\s+0\.0005 PMPE/);
+});
+
+test('fill-rank table uses redelegation budget and keeps SOL columns whole-numbered', () => {
+  const data = {
+    auctionData: {
+      epoch: 979,
+      stakeAmounts: {
+        marinadeSamTvlSol: 1000,
+      },
+      rewards: {
+        inflationPmpe: 0.30,
+        mevPmpe: 0.02,
+      },
+      validators: [
+        {
+          voteAccount: 'rank-two',
+          stakePriority: 20,
+          marinadeActivatedStakeSol: 100,
+          auctionStake: { marinadeSamTargetSol: 700 },
+          revShare: { bidPmpe: 0.15, totalPmpe: 0.435 },
+          lastCapConstraint: { constraintType: 'WANT' },
+        },
+        {
+          voteAccount: 'rank-one',
+          stakePriority: 10,
+          marinadeActivatedStakeSol: 300,
+          auctionStake: { marinadeSamTargetSol: 450.4 },
+          revShare: { bidPmpe: 0.301, totalPmpe: 0.621 },
+          lastCapConstraint: { constraintType: 'BOND' },
+        },
+        {
+          voteAccount: 'not-receiving',
+          stakePriority: 1,
+          marinadeActivatedStakeSol: 250,
+          auctionStake: { marinadeSamTargetSol: 250 },
+          revShare: { bidPmpe: 0.5 },
+          lastCapConstraint: null,
+        },
+      ],
+    },
+  };
+
+  const result = computeFillRankRowsFromResults(data, { limit: 9 });
+
+  assert.equal(result.redelegateBudget, 350);
+  assert.equal(result.receiverCount, 2);
+  assert.equal(result.rows[0].normalizedBidPmpe, 0.316);
+  assert.equal(result.rows[1].normalizedBidPmpe, 0.13);
+  assert.deepEqual(result.rows.map(row => ({
+    rank: row.rank,
+    voteAccount: row.voteAccount,
+    need: row.need,
+    fill: row.fill,
+    fillPct: row.fillPct,
+  })), [
+    { rank: 1, voteAccount: 'rank-one', need: 150.39999999999998, fill: 150.39999999999998, fillPct: 1 },
+    { rank: 2, voteAccount: 'rank-two', need: 600, fill: 199.60000000000002, fillPct: 0.3326666666666667 },
+  ]);
+
+  const table = formatFillRankTable(result);
+  assert.match(table, /Re-delegate budget: 350 SOL/);
+  assert.match(table, /Rank\s+Vote\s+Stake Priority\s+Target\s+Active\s+받을 Stake\s+Fill 예상\s+Fill\s+Bid\s+Bid @5\/0\s+Constraint/);
+  assert.match(table, /\b1\s+rank-one\s+10\s+450\s+300\s+150\s+150\s+100%\s+0\.3010\s+0\.3160\s+BOND/);
+  assert.match(table, /\b2\s+rank-two\s+20\s+700\s+100\s+600\s+200\s+33%\s+0\.1500\s+0\.1300\s+WANT/);
+  assert.doesNotMatch(table, /\|/);
 });
 
 test('refreshHeavyFiles reports failed heavy inputs before calculation can continue', async () => {

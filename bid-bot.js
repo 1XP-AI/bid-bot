@@ -5,6 +5,7 @@
 //   node bid-bot.js              # 1회 실행 (pm2 cron용)
 //   node bid-bot.js --setup      # ds-sam clone + install (자동)
 //   node bid-bot.js --status     # 현재 상태만 JSON 출력
+//   node bid-bot.js --fill-rank  # live 재계산 기준 stake fill 순위표
 //   node bid-bot.js --dry-run    # 변경 시뮬레이션만
 //   node bid-bot.js --loop       # 무한 루프
 //   node bid-bot.js --force-refresh  # heavy 캐시 강제 갱신
@@ -87,10 +88,19 @@ const VALIDATOR_NAME_TIMEOUT_MS = +get('VALIDATOR_NAME_TIMEOUT_MS', 'runtime.val
 const args = process.argv.slice(2);
 const MODE = args.includes('--setup')  ? 'setup'
            : args.includes('--status') ? 'status'
+           : args.includes('--fill-rank') ? 'fill-rank'
            : args.includes('--loop')   ? 'loop'
            : 'run';
 const FORCE_REFRESH = args.includes('--force-refresh');
 const FORCE_DRY     = args.includes('--dry-run');
+function readNumberArg(name, defaultValue) {
+  const inline = args.find(arg => arg.startsWith(`${name}=`));
+  if (inline) return Number(inline.slice(name.length + 1));
+  const index = args.indexOf(name);
+  if (index >= 0 && args[index + 1] != null) return Number(args[index + 1]);
+  return defaultValue;
+}
+const FILL_RANK_LIMIT = readNumberArg('--rank-limit', 9);
 const dryRunActive  = DRY_RUN || FORCE_DRY;
 const verboseLogs   = dryRunActive;
 const showCalculationTable = dryRunActive || MODE === 'loop';
@@ -124,6 +134,21 @@ function fmtSol(n) {
     ? `${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} SOL`
     : `${n} SOL`;
 }
+function fmtSol0(n) {
+  return Number.isFinite(n)
+    ? n.toLocaleString('en-US', { maximumFractionDigits: 0 })
+    : String(n);
+}
+function fmtPct0(n) {
+  return Number.isFinite(n)
+    ? `${(n * 100).toLocaleString('en-US', { maximumFractionDigits: 0 })}%`
+    : String(n);
+}
+function calcPmpeAfterCommission(pmpe, commissionDec) {
+  if (!Number.isFinite(pmpe) || pmpe <= 0) return 0;
+  if (!Number.isFinite(commissionDec) || commissionDec >= 1) return 0;
+  return Math.max(0, pmpe * (1 - commissionDec));
+}
 function fmtAccount(addr) {
   return addr && addr.length > 12 ? `${addr.slice(0, 6)}...${addr.slice(-4)}` : addr;
 }
@@ -148,6 +173,54 @@ function formatTable(title, rows) {
     `${'Item'.padEnd(labelWidth)}  ${'Value'.padEnd(valueWidth)}`,
     hr,
     ...rows.map(([label, value]) => `${label.padEnd(labelWidth)}  ${String(value).padEnd(valueWidth)}`),
+  ].join('\n');
+}
+function isWideCodePoint(code) {
+  return (
+    code >= 0x1100 && (
+      code <= 0x115f ||
+      code === 0x2329 ||
+      code === 0x232a ||
+      (code >= 0x2e80 && code <= 0xa4cf) ||
+      (code >= 0xac00 && code <= 0xd7a3) ||
+      (code >= 0xf900 && code <= 0xfaff) ||
+      (code >= 0xfe10 && code <= 0xfe19) ||
+      (code >= 0xfe30 && code <= 0xfe6f) ||
+      (code >= 0xff00 && code <= 0xff60) ||
+      (code >= 0xffe0 && code <= 0xffe6)
+    )
+  );
+}
+function displayWidth(value) {
+  return Array.from(String(value ?? '')).reduce((width, ch) => {
+    const code = ch.codePointAt(0);
+    if (code < 32 || (code >= 0x7f && code < 0xa0)) return width;
+    return width + (isWideCodePoint(code) ? 2 : 1);
+  }, 0);
+}
+function padDisplay(value, width, align = 'left') {
+  const text = String(value ?? '');
+  const padding = ' '.repeat(Math.max(0, width - displayWidth(text)));
+  return align === 'right' ? padding + text : text + padding;
+}
+function formatAlignedTable(headers, rows, opts = {}) {
+  const aligns = opts.aligns ?? headers.map(() => 'left');
+  const stringRows = rows.map(row => row.map(value => String(value ?? '')));
+  const widths = headers.map((header, index) => Math.max(
+    displayWidth(header),
+    ...stringRows.map(row => displayWidth(row[index] ?? '')),
+  ));
+  const formatRow = row => row
+    .map((value, index) => (
+      index === row.length - 1
+        ? String(value ?? '')
+        : padDisplay(value, widths[index], aligns[index])
+    ))
+    .join('  ');
+  return [
+    formatRow(headers),
+    widths.map(width => '-'.repeat(width)).join('  '),
+    ...stringRows.map(formatRow),
   ].join('\n');
 }
 function formatBidCalculationTable(status, onchainBid, targetBid, opts = {}) {
@@ -634,6 +707,90 @@ function extractMyStatusFromResults(data, voteAccount) {
   };
 }
 
+function computeFillRankRowsFromResults(data, opts = {}) {
+  const limit = Number.isFinite(opts.limit) && opts.limit > 0 ? Math.floor(opts.limit) : 9;
+  const validators = data.auctionData?.validators ?? [];
+  const rewards = data.auctionData?.rewards ?? {};
+  const normalizedOnchainPmpe =
+    calcPmpeAfterCommission(Number(rewards.inflationPmpe), 0.05) +
+    calcPmpeAfterCommission(Number(rewards.mevPmpe), 0);
+  const tvl = data.auctionData?.stakeAmounts?.marinadeSamTvlSol ?? 0;
+  const activeTotal = validators.reduce((sum, validator) => sum + Number(validator.marinadeActivatedStakeSol ?? 0), 0);
+  const redelegateBudget = Math.max(0, tvl - activeTotal);
+  const ranked = validators
+    .map((validator, sourceIndex) => {
+      const target = Number(validator.auctionStake?.marinadeSamTargetSol ?? 0);
+      const active = Number(validator.marinadeActivatedStakeSol ?? 0);
+      return {
+        sourceIndex,
+        voteAccount: validator.voteAccount,
+        stakePriority: validator.stakePriority,
+        target,
+        active,
+        need: target - active,
+        bidPmpe: validator.revShare?.bidPmpe,
+        normalizedBidPmpe: Number.isFinite(validator.revShare?.totalPmpe)
+          ? Math.max(0, validator.revShare.totalPmpe - normalizedOnchainPmpe)
+          : null,
+        constraint: validator.lastCapConstraint?.constraintType ?? null,
+      };
+    })
+    .filter(row => Number.isFinite(row.stakePriority) && row.stakePriority > 0)
+    .sort((a, b) => a.stakePriority - b.stakePriority || a.sourceIndex - b.sourceIndex)
+    .filter(row => row.need > 1e-9);
+
+  let remaining = redelegateBudget;
+  const rows = ranked.map((row, index) => {
+    const fill = Math.min(row.need, Math.max(0, remaining));
+    remaining -= fill;
+    return {
+      rank: index + 1,
+      ...row,
+      fill,
+      fillPct: row.need > 0 ? fill / row.need : 1,
+      remainingAfter: Math.max(0, remaining),
+    };
+  });
+
+  return {
+    epoch: data.auctionData?.epoch,
+    tvl,
+    activeTotal,
+    redelegateBudget,
+    receiverCount: rows.length,
+    rows: rows.slice(0, limit),
+    allRows: rows,
+  };
+}
+
+function formatFillRankTable(result) {
+  const summary = [
+    `Epoch: ${result.epoch}`,
+    `Re-delegate budget: ${fmtSol0(result.redelegateBudget)} SOL`,
+    `Receivers: ${result.receiverCount}`,
+  ].join('\n');
+  const table = formatAlignedTable(
+    ['Rank', 'Vote', 'Stake Priority', 'Target', 'Active', '받을 Stake', 'Fill 예상', 'Fill', 'Bid', 'Bid @5/0', 'Constraint'],
+    result.rows.map(row => [
+      row.rank,
+      fmtAccount(row.voteAccount),
+      row.stakePriority,
+      fmtSol0(row.target),
+      fmtSol0(row.active),
+      fmtSol0(row.need),
+      fmtSol0(row.fill),
+      fmtPct0(row.fillPct),
+      fmt4(row.bidPmpe),
+      fmt4(row.normalizedBidPmpe),
+      row.constraint ?? '',
+    ]),
+    {
+      aligns: ['right', 'left', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'left'],
+    },
+  );
+  return `${summary}\n\n${table}`;
+}
+
 // ============================================================
 // bid 결정 + 적용
 // ============================================================
@@ -831,6 +988,11 @@ async function runOnce() {
     console.log(JSON.stringify(status, null, 2));
     return;
   }
+  if (MODE === 'fill-rank') {
+    const data = JSON.parse(readFileSync(`${OUTPUT_DIR}/results.json`, 'utf8'));
+    console.log(formatFillRankTable(computeFillRankRowsFromResults(data, { limit: FILL_RANK_LIMIT })));
+    return;
+  }
 
   // samEligible 체크는 비활성화되었습니다 (사용자 요청).
   if (!status.samEligible) {
@@ -923,6 +1085,7 @@ export {
   calculateEpochTiming,
   capSingleDrop,
   chooseLoopDelayMs,
+  computeFillRankRowsFromResults,
   computeRecentMinFloor,
   computeTargetBid,
   extractMyEffBidsFromAuctions,
@@ -930,6 +1093,7 @@ export {
   findValidatorNameByVoteAccount,
   formatDiscordContent,
   formatBidCalculationTable,
+  formatFillRankTable,
   fmtDuration,
   isTargetInSanityRange,
   parseCpmpeBid,
@@ -947,7 +1111,7 @@ async function checkPrereqs() {
     if (!which(cmd)) die(`${cmd} 필요. 시스템에 설치 후 재시도`);
   }
   if (!VOTE_ADDR) die(`voteAccount 미설정. ${CONFIG_HELP}`);
-  if (MODE === 'status') return;
+  if (MODE === 'status' || MODE === 'fill-rank') return;
 
   if (!BOND_ADDR && (!KEYPAIR_FILE || !existsSync(KEYPAIR_FILE))) {
     die(`bondAccount 미설정. keypair 없이 dry-run하려면 validator.bondAccount를 입력하세요. ${CONFIG_HELP}`);

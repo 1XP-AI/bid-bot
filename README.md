@@ -5,7 +5,7 @@ Marinade SAM 자동 bid 관리 봇. 로컬에서 ds-sam SDK를 직접 실행해 
 ## 핵심 기능
 
 - **로컬 ds-sam 실행**: 다른 validator의 mid-epoch bid 변동 즉시 감지 (scoring API보다 빠름)
-- **3중 floor**: penalty 회피 + winning 유지 + 안전 버퍼
+- **4중 floor**: penalty 회피 + winning 유지 + 안전 버퍼 + 최근 bid floor
 - **자동 설치**: ds-sam, pnpm, 의존성 모두 자동
 - **PM2 통합**: 상시 실행 + epoch 임박 시 빠른 체크
 - **bond account 자동 resolve**: vote account에서 bond account를 derive하거나 설정값 사용
@@ -19,7 +19,7 @@ Marinade SAM 자동 bid 관리 봇. 로컬에서 ds-sam SDK를 직접 실행해 
 - `git`
 - `curl`
 - `validator-bonds` CLI 2.4.6 이상 (`npm install -g @marinade.finance/validator-bonds-cli@latest`)
-- Marinade config account keypair (`validator.authFile`, `validator.keypairFile`에 지정)
+- 실전 bid 적용용 Marinade config account keypair (`validator.authFile`, `validator.keypairFile`에 지정)
 
 `pnpm`은 자동으로 설치 시도합니다 (corepack / npm / standalone installer 순).
 
@@ -51,7 +51,20 @@ chmod +x bid-bot.js
 
 ## 사용법
 
-### 1. 첫 실행 — ds-sam 자동 설치
+### 명령 요약
+
+| 명령 | 용도 | on-chain 변경 |
+| --- | --- | --- |
+| `node bid-bot.js --setup` | ds-sam clone/install/build 준비 | 없음 |
+| `node bid-bot.js --dry-run` | 실제 적용 없이 계산과 적용 명령만 확인 | 없음 |
+| `node bid-bot.js --status` | 내 validator의 ds-sam 계산 결과를 JSON으로 출력 | 없음 |
+| `node bid-bot.js --fill-rank --rank-limit 9` | live bonds 기준 stake fill 예상 순위표 출력 | 없음 |
+| `node bid-bot.js` | 1회 계산 후 필요하면 bid 적용 | `runtime.dryRun=false`이면 있음 |
+| `node bid-bot.js --loop` | 계속 실행하면서 주기적으로 bid 점검 | `runtime.dryRun=false`이면 있음 |
+
+`--force-refresh`를 함께 붙이면 24시간 캐시를 무시하고 ds-sam 입력 파일을 다시 받습니다. 예: `node bid-bot.js --fill-rank --rank-limit 20 --force-refresh`.
+
+### 1. 첫 실행 - ds-sam 자동 설치
 
 ```bash
 node bid-bot.js --setup
@@ -61,7 +74,7 @@ npm run setup
 
 5~10분 걸림 (ds-sam clone + pnpm install + build).
 
-### 2. 안전 검증 — DRY_RUN 모드
+### 2. 안전 검증 - DRY_RUN 모드
 
 ```bash
 node bid-bot.js --dry-run
@@ -98,19 +111,27 @@ node bid-bot.js --status
 
 내 validator의 모든 메트릭 JSON으로 출력.
 
-### 4. 테스트
+### 4. Live fill 순위표
 
 ```bash
-npm test
+node bid-bot.js --fill-rank --rank-limit 9
 ```
 
-테스트는 네트워크와 on-chain 적용 없이 중요한 계산값만 확인합니다.
-- 목표 bid 계산: safety ratio, winning buffer, permitted deviation 중 가장 높은 값 선택
-- cpmpe 변환: PMPE bid를 `validator-bonds --cpmpe` lamports 값으로 변환
-- on-chain bid 파싱: `costPerMillePerEpoch` 값이 비어 있거나 깨졌을 때 중단
-- 변경 기준: 작은 차이는 tx를 보내지 않음
-- 큰 폭 인하 제한: 한 번에 너무 많이 낮추지 않음
-- epoch-aware loop: epoch 종료 임박 시 5분 주기로 전환
+live bonds API를 반영해 ds-sam을 다시 계산한 뒤, `stakePriority` 오름차순으로 정렬하고 `SAM Target - SAM Active > 0`인 validator만 보여줍니다. `Fill 예상`은 대시보드의 `Stake To Distribute`와 같은 기준인 `SAM TVL - Active 합계` budget으로 계산합니다. `Bid @5/0`은 모든 validator를 commission 5%, tip/MEV commission 0% 기준으로 맞췄을 때의 환산 bid입니다.
+
+예시:
+
+```text
+Epoch: 979
+Re-delegate budget: 63,044 SOL
+Receivers: 32
+
+Rank  Vote            Stake Priority   Target   Active  받을 Stake  Fill 예상  Fill     Bid  Bid @5/0  Constraint
+----  --------------  --------------  -------  -------  ----------  ---------  ----  ------  --------  ----------
+   1  A11pGb...KtS5               14   17,528    4,897      12,631     12,631  100%  0.3010    0.3164  BOND
+   2  HHLMTH...ubgq               25  300,000  164,538     135,462     50,413   37%  0.1510    0.1664  WANT
+   3  R2D2vs...UWNj               26   35,413   35,215         198          0    0%  0.1500    0.1500  BOND
+```
 
 ### 5. PM2로 자동화
 
@@ -124,12 +145,12 @@ pm2 save  # 재부팅 후 자동 시작
 
 기본: `--loop` 모드로 PM2가 항상 살려두고, 스크립트가 내부 timer로 반복 체크. 평소에는 `runtime.loopInterval`초마다 확인하고, `runtime.epochAware.enabled`가 켜져 있으면 Solana epoch 종료가 가까울 때 더 짧은 주기로 확인합니다.
 
-실전 반복 실행에서는 로그를 조용하게 유지합니다. 정상적으로 계산했지만 bid 변경이 필요 없으면 매 회차 진행 로그를 남기지 않고, 실패/경고/실제 bid 변경처럼 확인이 필요한 이벤트만 기록합니다. 상세 계산표가 필요하면 `--dry-run`으로 확인하세요.
+`--loop`는 시작 로그를 한 번만 출력하고, 매 회차 계산표를 표시합니다. 반복 실행 중에는 고정 설정값을 매번 늘어놓지 않고 계산 결과, 경고, 실패, 실제 bid 변경처럼 확인이 필요한 내용 위주로 남깁니다.
 
 실제 bid 변경이 필요한 회차에는 설정 고정값은 빼고, 계산에서 나온 값과 실제 변경될 값만 표로 남깁니다.
 
 ```text
-[2026-05-07 19:30:00 KST] bid 변경 계산
+[2026-05-07 19:30:00 KST] 계산 결과
 Item            Value
 --------------  --------------------------
 Epoch           968
@@ -158,7 +179,22 @@ node bid-bot.js --loop
 
 평소에는 `runtime.loopInterval` 초마다 반복합니다. `runtime.epochAware.enabled`가 켜져 있으면 epoch 종료 임박 구간에서 `runtime.epochAware.fastLoopIntervalSeconds`를 사용합니다.
 
-`--loop --dry-run`으로 실행하면 매 회차 상세 계산표를 출력합니다. 운영용 loop에서는 dry-run을 끄는 것을 권장합니다.
+운영 적용 전에는 `node bid-bot.js --loop --dry-run`으로 같은 loop 흐름을 트랜잭션 없이 확인할 수 있습니다. 운영용 loop에서는 `runtime.dryRun=false`로 바꾼 뒤 PM2로 실행하는 것을 권장합니다.
+
+### 7. 테스트
+
+```bash
+npm test
+```
+
+테스트는 네트워크와 on-chain 적용 없이 중요한 계산값만 확인합니다.
+- 목표 bid 계산: safety ratio, winning buffer, permitted deviation, 최근 bid floor 중 가장 높은 값 선택
+- cpmpe 변환: PMPE bid를 `validator-bonds --cpmpe` lamports 값으로 변환
+- on-chain bid 파싱: `costPerMillePerEpoch` 값이 비어 있거나 깨졌을 때 중단
+- 변경 기준: 작은 차이는 tx를 보내지 않음
+- 큰 폭 인하 제한: 한 번에 너무 많이 낮추지 않음
+- epoch-aware loop: epoch 종료 임박 시 빠른 주기로 전환
+- fill rank 계산: `stakePriority` 정렬, positive target gap 필터, re-delegate budget 소진 순서
 
 ## 설정 관리
 
@@ -177,41 +213,52 @@ BID_BOT_CONFIG=/path/to/my-bid-bot.json node bid-bot.js --dry-run
 
 ## 설정 값 (로컬 bid-bot.json)
 
-처음에는 `validator.voteAccount`, `validator.authFile`, `validator.keypairFile`, `runtime.dryRun`만 확인하면 됩니다. 나머지는 기본값으로 시작해도 됩니다.
+처음에는 `validator.voteAccount`, `validator.authFile`, `validator.keypairFile`, `runtime.dryRun`만 확인하면 됩니다. `--status`, `--fill-rank`는 읽기 전용이라 keypair 없이도 실행할 수 있지만, 실제 bid 적용에는 `authFile`과 `keypairFile`이 필요합니다.
 
 ```jsonc
 {
   "validator": {
-    // 내 validator의 vote account. 필수.
+    // 내 validator의 vote account. 이 값은 반드시 채워야 함.
     "voteAccount": "당신의 vote account",
 
     // bond account를 알고 있으면 입력. 모르면 빈 값으로 둬도 됨.
-    // 비워두면 keypairFile을 사용해서 자동으로 찾음.
+    // 비워두면 validator-bonds bond-address <voteAccount>로 자동 계산.
     "bondAccount": "",
 
-    // 실제 bid 변경 권한을 가진 authority keypair 파일.
-    // 보통 keypairFile과 같은 파일을 넣음.
+    // bid 변경 권한을 가진 Marinade config authority keypair.
+    // 실전 적용할 때 필요. 보통 keypairFile과 같은 파일.
     "authFile": "./keys/keypair.json",
 
-    // validator-bonds CLI가 트랜잭션을 만들 때 사용할 keypair 파일.
-    // dry-run만 할 때는 bondAccount를 직접 넣으면 없어도 됨.
+    // validator-bonds CLI가 트랜잭션 fee payer/signing에 사용할 keypair.
+    // dry-run만 할 때도 bondAccount가 비어 있으면 이 파일로 bond PDA를 찾음.
     "keypairFile": "./keys/keypair.json"
   },
+  "dssam": {
+    // ds-sam repo와 입출력 파일을 둘 위치. 보통 기본값 유지.
+    "dir": "./ds-sam",
+    "pipelineDir": "./ds-sam-pipeline",
+    "cacheDir": "./ds-sam-cache",
+    "outputDir": "./ds-sam-output",
+
+    // bonds.json을 제외한 보조 입력 파일을 몇 초 동안 재사용할지.
+    // bonds.json은 live bid 데이터라 매 회차 새로 받음.
+    "heavyCacheTtl": 86400
+  },
   "bidStrategy": {
-    // 필요한 bid보다 몇 % 더 여유 있게 올릴지.
-    // 1.025 = 계산값보다 2.5% 높게 설정.
+    // 계산된 참여 bid보다 몇 % 더 여유 있게 둘지.
+    // 1.025 = 2.5% 여유.
     "safetyRatio": 1.025,
 
-    // winning 기준보다 최소 얼마 더 높게 둘지.
-    // 값이 너무 작으면 작은 시장 변화에도 밀릴 수 있음.
+    // 현재 winning 기준보다 최소 얼마 더 높게 둘지.
+    // 작은 시장 변화로 바로 밀리지 않기 위한 여유값.
     "winBufferPmpe": 0.0005,
 
-    // 페널티가 나지 않는 선에서 허용할 여유.
-    // 0.01 = 1%. 보통 기본값 유지.
+    // 페널티 없이 허용할 수 있는 bid 편차.
+    // 0.01 = 1%. 특별한 이유가 없으면 기본값 유지.
     "permittedDev": 0.01,
 
-    // 현재 bid와 목표 bid 차이가 이 값보다 작으면 변경하지 않음.
-    // 너무 작게 잡으면 불필요한 tx가 자주 나감.
+    // 현재 bid와 목표 bid 차이가 이 값보다 작으면 tx를 보내지 않음.
+    // 너무 낮추면 의미 없는 작은 변경이 자주 나감.
     "minBidChangePmpe": 0.0005,
 
     // 목표 bid가 이 값보다 낮게 계산되면 이상값으로 보고 중단.
@@ -222,9 +269,18 @@ BID_BOT_CONFIG=/path/to/my-bid-bot.json node bid-bot.js --dry-run
 
     // bid를 낮출 때 한 번에 내릴 수 있는 최대 폭.
     // 급격한 인하로 auction에서 밀리는 상황을 막기 위한 안전장치.
-    "maxSingleDrop": 0.02
+    "maxSingleDrop": 0.02,
+
+    // bid-too-low 페널티를 피하기 위한 추가 floor.
+    // 최근 4 epoch의 내 effParticipatingBidPmpe 최저값에 1.03을 곱해 하한으로 사용.
+    "recentMinLookbackEpochs": 4,
+    "recentMinMultiplier": 1.03
   },
   "logging": {
+    // 파일 로그와 마지막 변경 상태를 저장할 위치.
+    "logFile": "./bid-bot.log",
+    "stateFile": "./bid-bot.state",
+
     // Discord 알림을 받을 webhook URL. 알림이 필요 없으면 빈 값.
     "discordWebhook": "https://discord.com/api/webhooks/..."
   },
@@ -234,7 +290,7 @@ BID_BOT_CONFIG=/path/to/my-bid-bot.json node bid-bot.js --dry-run
     "dryRun": true,
 
     // --loop 또는 PM2 실행 시 몇 초마다 한 번씩 확인할지.
-    // epoch 종료가 아직 멀 때 사용하는 기본 주기.
+    // epoch 종료가 아직 멀 때 사용하는 기본 주기. 3600 = 1시간.
     "loopInterval": 3600,
 
     "epochAware": {
@@ -278,14 +334,33 @@ BID_BOT_CONFIG=/path/to/my-bid-bot.json node bid-bot.js --dry-run
 ## bid 결정 공식
 
 ```
+recentMinFloor = 최근 N epoch 내 effParticipatingBidPmpe 최저값 x multiplier
+
 target = max(
   effPart × (1 - permittedDev),    // 페널티 0 floor
   effPart + winBufferPmpe,         // winning 유지 floor
-  effPart × safetyRatio            // 안전 buffer
+  effPart × safetyRatio,           // 안전 buffer
+  recentMinFloor                   // bid-too-low 페널티 방지 floor
 )
 ```
 
-세 floor 중 가장 높은 값. 페널티 0 + winning 유지 + 변동성 대비.
+네 floor 중 가장 높은 값을 목표 bid로 잡습니다. `recentMinFloor`는 최근 epoch 기준으로 너무 급하게 낮추다가 bid-too-low 페널티를 받는 상황을 막기 위한 추가 안전장치입니다.
+
+이 스크립트가 on-chain에 적용하는 값은 `validator-bonds configure-bond --cpmpe ...`뿐입니다. `--max-stake-wanted`는 변경하지 않습니다.
+
+## Fill rank 계산 기준
+
+`--fill-rank`는 tx를 보내지 않는 조회용 명령입니다. live bonds API를 반영해 ds-sam을 다시 계산한 뒤 아래 순서로 표를 만듭니다.
+
+```
+reDelegateBudget = max(0, marinadeSamTvlSol - sum(marinadeActivatedStakeSol))
+receivers = validators
+  -> stakePriority 오름차순 정렬
+  -> SAM Target - SAM Active > 0 필터
+  -> reDelegateBudget을 앞 순위부터 차례대로 배분
+```
+
+표의 `받을 Stake`는 `SAM Target - SAM Active`이고, `Fill 예상`은 이번 re-delegate budget으로 실제 채워질 것으로 계산한 수량입니다. `Bid @5/0`은 현재 `totalPmpe`에서 commission 5%, tip/MEV commission 0% 기준 on-chain reward를 뺀 값입니다.
 
 ## 동작 흐름
 
@@ -297,10 +372,15 @@ target = max(
 3. 나머지 입력 fetch (24h 캐시)
 4. ds-sam 로컬 실행 (5~10초)
 5. results.json에서 내 validator 추출
-6. target bid 계산
-7. bond account resolve 후 on-chain 현재값과 비교
-8. 차이 의미 있으면 validator-bonds CLI로 적용
-9. Discord 알림
+6. 모드별 처리
+   - --status: 내 validator JSON 출력 후 종료
+   - --fill-rank: live fill 순위표 출력 후 종료
+   - run/loop/dry-run: target bid 계산
+7. bond account resolve 후 on-chain 현재 cpmpe와 비교
+8. 차이 의미 있으면 validator-bonds configure-bond --cpmpe로 적용
+   - bid 인하일 때는 validator-bonds --force를 함께 사용
+   - dry-run이면 실제 tx 없이 적용 명령만 확인
+9. 변경 성공/실패와 경고를 Discord로 알림
 ```
 
 ## 모니터링
@@ -362,7 +442,7 @@ pnpm -r build
 
 ## 안전장치
 
-1. **3중 floor**: penalty/winning/safety 동시 만족
+1. **4중 floor**: penalty/winning/safety/recent-min floor 동시 고려
 2. **MIN_SANITY_BID, MAX_SANITY_BID**: 비정상 값 차단
 3. **MAX_SINGLE_DROP**: 큰 폭 인하 방지 (단계적)
 4. **stale cache 차단**: live/heavy 데이터 갱신 실패 시 오래된 입력으로 적용하지 않음
