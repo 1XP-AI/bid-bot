@@ -212,9 +212,11 @@ function padDisplay(value, width, align = 'left') {
 }
 function formatAlignedTable(headers, rows, opts = {}) {
   const aligns = opts.aligns ?? headers.map(() => 'left');
+  const headerLines = headers.map(header => String(header ?? '').split('\n'));
+  const headerHeight = Math.max(1, ...headerLines.map(lines => lines.length));
   const stringRows = rows.map(row => row.map(value => String(value ?? '')));
-  const widths = headers.map((header, index) => Math.max(
-    displayWidth(header),
+  const widths = headers.map((_, index) => Math.max(
+    ...headerLines[index].map(line => displayWidth(line)),
     ...stringRows.map(row => displayWidth(row[index] ?? '')),
   ));
   const formatRow = row => row
@@ -223,9 +225,13 @@ function formatAlignedTable(headers, rows, opts = {}) {
         ? String(value ?? '')
         : padDisplay(value, widths[index], aligns[index])
     ))
-    .join('  ');
+    .join('  ')
+    .trimEnd();
+  const headerRows = Array.from({ length: headerHeight }, (_, lineIndex) => (
+    formatRow(headers.map((_, index) => headerLines[index][lineIndex] ?? ''))
+  ));
   return [
-    formatRow(headers),
+    ...headerRows,
     widths.map(width => '-'.repeat(width)).join('  '),
     ...stringRows.map(formatRow),
   ].join('\n');
@@ -802,7 +808,7 @@ function formatFillRankTable(result) {
     `Receivers: ${result.receiverCount}`,
   ].join('\n');
   const table = formatAlignedTable(
-    ['Rank', 'Vote', 'Stake Priority', 'Target', 'Active', '받을 Stake', 'Fill 예상', 'Fill', 'Bid', 'Bid @5/0', 'Constraint'],
+    ['Rank', 'Vote', 'Stake\nPriority', 'Target', 'Active', '받을 Stake', 'Fill 예상', 'Fill', 'Bid', 'Bid @5/0'],
     result.rows.map(row => [
       row.rank,
       fmtAccount(row.voteAccount),
@@ -814,10 +820,9 @@ function formatFillRankTable(result) {
       fmtPct0(row.fillPct),
       fmt4(row.bidPmpe),
       fmt4(row.normalizedBidPmpe),
-      row.constraint ?? '',
     ]),
     {
-      aligns: ['right', 'left', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'left'],
+      aligns: ['right', 'left', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right'],
     },
   );
   return `${summary}\n\n${table}`;

@@ -321,9 +321,13 @@ test('fill-rank table uses redelegation budget and keeps SOL columns whole-numbe
 
   const table = formatFillRankTable(result);
   assert.match(table, /Re-delegate budget: 350 SOL/);
-  assert.match(table, /Rank\s+Vote\s+Stake Priority\s+Target\s+Active\s+받을 Stake\s+Fill 예상\s+Fill\s+Bid\s+Bid @5\/0\s+Constraint/);
-  assert.match(table, /\b1\s+rank-one\s+10\s+450\s+300\s+150\s+150\s+100%\s+0\.3010\s+0\.3160\s+BOND/);
-  assert.match(table, /\b2\s+rank-two\s+20\s+700\s+100\s+600\s+200\s+33%\s+0\.1500\s+0\.1300\s+WANT/);
+  assert.match(table, /Rank\s+Vote\s+Stake\s+Target\s+Active\s+받을 Stake\s+Fill 예상\s+Fill\s+Bid\s+Bid @5\/0/);
+  assert.match(table, /Priority/);
+  assert.match(table, /\b1\s+rank-one\s+10\s+450\s+300\s+150\s+150\s+100%\s+0\.3010\s+0\.3160/);
+  assert.match(table, /\b2\s+rank-two\s+20\s+700\s+100\s+600\s+200\s+33%\s+0\.1500\s+0\.1300/);
+  assert.doesNotMatch(table, /Constraint/);
+  assert.doesNotMatch(table, /BOND/);
+  assert.doesNotMatch(table, /WANT/);
   assert.doesNotMatch(table, /\|/);
 });
 
@@ -345,16 +349,18 @@ test('fill-rank Discord report sends only when the table changes', () => {
 
 test('Discord fill-rank messages wrap fixed-width tables in code blocks', () => {
   const table = [
-    'Rank  Vote           Stake Priority',
-    '----  -------------  --------------',
-    '   1  A11pGb...KtS5              14',
+    'Rank  Vote           Stake  Target',
+    '                       Priority',
+    '----  -------------  --------  ------',
+    '   1  A11pGb...KtS5        14  19,335',
   ].join('\n');
 
   const [message] = formatDiscordCodeBlockMessages('📊 `bid-bot`: fill-rank --rank-limit 9', table);
 
   assert.match(message, /^📊 `bid-bot`: fill-rank --rank-limit 9\n```text\n/);
-  assert.match(message, /Rank  Vote           Stake Priority/);
-  assert.match(message, /   1  A11pGb\.\.\.KtS5              14/);
+  assert.match(message, /Rank  Vote           Stake  Target/);
+  assert.match(message, /Priority/);
+  assert.match(message, /   1  A11pGb\.\.\.KtS5        14  19,335/);
   assert.match(message, /\n```$/);
 });
 
