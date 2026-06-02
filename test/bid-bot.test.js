@@ -410,6 +410,9 @@ test('fill-rank table uses redelegation budget and keeps SOL columns whole-numbe
   assert.match(svg, /Fill/);
   assert.match(svg, /Expected/);
   assert.match(svg, /rank-one/);
+  assert.match(svg, /fill="#0b0b0f"/);
+  assert.match(svg, /fill: #f8fafc/);
+  assert.match(svg, /fill="#047857"/);
   assert.doesNotMatch(svg, /받을 Stake/);
 
   const png = await renderFillRankImagePng(result, {

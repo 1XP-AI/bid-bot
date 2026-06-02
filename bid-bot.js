@@ -941,28 +941,28 @@ function formatFillRankImageSvg(result, opts = {}) {
       cellText(col.value(row), col, y + 29, 'class="body-text"')
     )).join('\n');
     return `
-      <rect x="${marginX}" y="${y}" width="${tableWidth}" height="${rowHeight}" fill="${rowIndex % 2 === 0 ? '#ffffff' : '#f8fafc'}"/>
-      <rect x="${marginX}" y="${y}" width="${fillWidth.toFixed(2)}" height="${rowHeight}" fill="#dcfce7" opacity="0.55"/>
+      <rect x="${marginX}" y="${y}" width="${tableWidth}" height="${rowHeight}" fill="${rowIndex % 2 === 0 ? '#18181b' : '#202126'}"/>
+      <rect x="${marginX}" y="${y}" width="${fillWidth.toFixed(2)}" height="${rowHeight}" fill="#047857" opacity="0.46"/>
       ${cells}
-      <line x1="${marginX}" y1="${y + rowHeight}" x2="${marginX + tableWidth}" y2="${y + rowHeight}" stroke="#e2e8f0" stroke-width="1"/>
+      <line x1="${marginX}" y1="${y + rowHeight}" x2="${marginX + tableWidth}" y2="${y + rowHeight}" stroke="#34343a" stroke-width="1"/>
     `;
   }).join('\n');
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
   <style>
-    .title { font: 700 30px Inter, Arial, sans-serif; fill: #0f172a; }
-    .summary { font: 500 22px Inter, Arial, sans-serif; fill: #334155; }
-    .header-text { font: 700 20px Inter, Arial, sans-serif; fill: #334155; }
-    .body-text { font: 500 22px Inter, Arial, sans-serif; fill: #0f172a; }
+    .title { font: 700 30px Inter, Arial, sans-serif; fill: #f8fafc; }
+    .summary { font: 500 22px Inter, Arial, sans-serif; fill: #cbd5e1; }
+    .header-text { font: 700 20px Inter, Arial, sans-serif; fill: #e5e7eb; }
+    .body-text { font: 500 22px Inter, Arial, sans-serif; fill: #f8fafc; }
   </style>
-  <rect width="100%" height="100%" rx="22" fill="#f1f5f9"/>
-  <rect x="16" y="16" width="${width - 32}" height="${height - 32}" rx="18" fill="#ffffff" stroke="#cbd5e1"/>
+  <rect width="100%" height="100%" rx="22" fill="#0b0b0f"/>
+  <rect x="16" y="16" width="${width - 32}" height="${height - 32}" rx="18" fill="#111113" stroke="#34343a"/>
   ${text(`${title}${reason}`, marginX, titleY, 'class="title"')}
   ${text(summary, marginX, summaryY, 'class="summary"')}
-  <rect x="${marginX}" y="${tableTop}" width="${tableWidth}" height="${headerHeight}" rx="10" fill="#e2e8f0"/>
+  <rect x="${marginX}" y="${tableTop}" width="${tableWidth}" height="${headerHeight}" rx="10" fill="#2a2b31"/>
   ${headerCells}
-  <line x1="${marginX}" y1="${tableTop + headerHeight}" x2="${marginX + tableWidth}" y2="${tableTop + headerHeight}" stroke="#cbd5e1" stroke-width="2"/>
+  <line x1="${marginX}" y1="${tableTop + headerHeight}" x2="${marginX + tableWidth}" y2="${tableTop + headerHeight}" stroke="#3f4048" stroke-width="2"/>
   ${rowGroups}
 </svg>`;
 }
