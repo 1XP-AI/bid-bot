@@ -16,7 +16,7 @@
     "test": "node --test test/*.test.js"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18.17.0"
   },
   "keywords": [
     "marinade",
@@ -30,5 +30,7 @@
     "type": "git",
     "url": "https://github.com/1XP-AI/bid-bot.git"
   },
-  "dependencies": {}
+  "dependencies": {
+    "sharp": "^0.34.5"
+  }
 }

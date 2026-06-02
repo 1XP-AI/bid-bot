@@ -13,6 +13,7 @@ import {
   formatDiscordCodeBlockMessages,
   formatDiscordContent,
   formatBidCalculationTable,
+  formatFillRankImageSvg,
   formatFillRankTable,
   fmtDuration,
   hasFillRankTableChanged,
@@ -20,8 +21,11 @@ import {
   parseCpmpeBid,
   patchDsSamSdkForPrereleaseVersions,
   pmpeToCpmpeLamports,
+  readOptionalNumberArg,
   refreshHeavyFiles,
+  renderFillRankImagePng,
   resolveMode,
+  resolveManualBidFloor,
   shouldChangeBid,
   shouldCheckScheduledFillRankReport,
 } from '../bid-bot.js';
@@ -54,6 +58,53 @@ test('computeTargetBid includes the permitted-deviation floor in the max calcula
   });
 
   assert.equal(target, 0.11);
+});
+
+test('computeTargetBid respects an active manual bid floor', () => {
+  const target = computeTargetBid(0.08, {
+    safetyRatio: 1.025,
+    winBufferPmpe: 0.0005,
+    permittedDev: 0.01,
+    manualBidFloor: 0.1049,
+  });
+
+  assert.equal(target, 0.1049);
+});
+
+test('manual bid floor is epoch-scoped and expires after the selected epoch', () => {
+  assert.deepEqual(resolveManualBidFloor(980, {
+    manualMinBidPmpe: 0.1049,
+    manualMinBidUntilEpoch: 980,
+  }), {
+    floor: 0.1049,
+    active: true,
+    expired: false,
+    untilEpoch: 980,
+  });
+
+  assert.deepEqual(resolveManualBidFloor(981, {
+    manualMinBidPmpe: 0.1049,
+    manualMinBidUntilEpoch: 980,
+  }), {
+    floor: 0,
+    active: false,
+    expired: true,
+    untilEpoch: 980,
+  });
+});
+
+test('manual bid floor flags parse inline and separated values', () => {
+  assert.equal(readOptionalNumberArg([
+    '--loop',
+    '--manual-min-bid-pmpe',
+    '0.1049',
+  ], '--manual-min-bid-pmpe'), 0.1049);
+
+  assert.equal(readOptionalNumberArg([
+    '--manual-min-bid-until-epoch=981',
+  ], '--manual-min-bid-until-epoch'), 981);
+
+  assert.equal(readOptionalNumberArg(['--manual-min-bid-pmpe', 'abc'], '--manual-min-bid-pmpe'), null);
 });
 
 test('PMPE to cpmpe lamports conversion is stable', () => {
@@ -243,6 +294,27 @@ test('bid change table shows dynamic values without fixed config thresholds by d
   assert.doesNotMatch(table, /Min Change/);
 });
 
+test('bid change table shows an active manual floor when configured', () => {
+  const status = {
+    epoch: 980,
+    samEligible: true,
+    winningTotalPmpe: 0.34794449828177,
+    totalPmpe: 0.349377606604357,
+    cutoffMargin: 0.001433108322587029,
+    effPart: 0.0800,
+    bidTooLowPenalty: 0,
+    samTargetSol: 96820.57032704525,
+  };
+
+  const table = formatBidCalculationTable(status, 0.1049, 0.1049, {
+    manualBidFloor: 0.1049,
+    manualBidFloorUntilEpoch: 980,
+  });
+
+  assert.match(table, /Manual Floor\s+0\.1049 PMPE \(until epoch 980\)/);
+  assert.match(table, /Target Bid\s+0\.1049 PMPE/);
+});
+
 test('dry-run bid table can include the fixed min-change threshold explicitly', () => {
   const status = {
     epoch: 968,
@@ -262,7 +334,7 @@ test('dry-run bid table can include the fixed min-change threshold explicitly', 
   assert.match(table, /Min Change\s+0\.0005 PMPE/);
 });
 
-test('fill-rank table uses redelegation budget and keeps SOL columns whole-numbered', () => {
+test('fill-rank table uses redelegation budget and keeps SOL columns whole-numbered', async () => {
   const data = {
     auctionData: {
       epoch: 979,
@@ -329,6 +401,22 @@ test('fill-rank table uses redelegation budget and keeps SOL columns whole-numbe
   assert.doesNotMatch(table, /BOND/);
   assert.doesNotMatch(table, /WANT/);
   assert.doesNotMatch(table, /\|/);
+
+  const svg = formatFillRankImageSvg(result, {
+    title: 'fill-rank --rank-limit 9',
+    reason: 'changed',
+  });
+  assert.match(svg, /^<\?xml version="1\.0" encoding="UTF-8"\?>\n<svg /);
+  assert.match(svg, /Fill/);
+  assert.match(svg, /Expected/);
+  assert.match(svg, /rank-one/);
+  assert.doesNotMatch(svg, /받을 Stake/);
+
+  const png = await renderFillRankImagePng(result, {
+    title: 'fill-rank --rank-limit 9',
+    reason: 'changed',
+  });
+  assert.deepEqual([...png.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 });
 
 test('scheduled fill-rank report checks immediately and then every hour', () => {

@@ -7,6 +7,7 @@
 //   node bid-bot.js --status     # 현재 상태만 JSON 출력
 //   node bid-bot.js --fill-rank  # live 재계산 기준 stake fill 순위표
 //   node bid-bot.js --loop --fill-rank --rank-limit 9  # loop 중 Discord fill-rank 알림
+//   node bid-bot.js --loop --manual-min-bid-pmpe 0.1049 --manual-min-bid-until-epoch 981
 //   node bid-bot.js --dry-run    # 변경 시뮬레이션만
 //   node bid-bot.js --loop       # 무한 루프
 //   node bid-bot.js --force-refresh  # heavy 캐시 강제 갱신
@@ -19,6 +20,7 @@ import {
 import { spawnSync } from 'child_process';
 import { resolve, dirname } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
+import sharp from 'sharp';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -32,10 +34,28 @@ const CONFIG_HELP = process.env.BID_BOT_CONFIG
 const userCfg = existsSync(CONFIG_PATH)
   ? JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))
   : {};
+const args = process.argv.slice(2);
 
 function get(envVar, jsonPath, defaultVal) {
   if (process.env[envVar] !== undefined) return process.env[envVar];
   return getJson(jsonPath) ?? defaultVal;
+}
+function getOptionalEnvNumber(envVar) {
+  const raw = process.env[envVar];
+  if (raw == null || raw === '') return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+function readNumberArg(argv, name, defaultValue) {
+  const inline = argv.find(arg => arg.startsWith(`${name}=`));
+  if (inline) return Number(inline.slice(name.length + 1));
+  const index = argv.indexOf(name);
+  if (index >= 0 && argv[index + 1] != null) return Number(argv[index + 1]);
+  return defaultValue;
+}
+function readOptionalNumberArg(argv, name) {
+  const value = readNumberArg(argv, name, null);
+  return Number.isFinite(value) ? value : null;
 }
 function getJson(jsonPath) {
   let v = userCfg;
@@ -68,6 +88,8 @@ const MAX_SINGLE_DROP     = +get('MAX_SINGLE_DROP',     'bidStrategy.maxSingleDr
 // bid-too-low 페널티 방지: 최근 N 에폭 동안의 내 bidPmpe 최소값 × multiplier를 floor로 사용
 const RECENT_MIN_LOOKBACK_EPOCHS = +get('RECENT_MIN_LOOKBACK_EPOCHS', 'bidStrategy.recentMinLookbackEpochs', 4);
 const RECENT_MIN_MULTIPLIER      = +get('RECENT_MIN_MULTIPLIER',      'bidStrategy.recentMinMultiplier',     1.03);
+const MANUAL_MIN_BID_PMPE        = readOptionalNumberArg(args, '--manual-min-bid-pmpe') ?? getOptionalEnvNumber('MANUAL_MIN_BID_PMPE') ?? 0;
+const MANUAL_MIN_BID_UNTIL_EPOCH = readOptionalNumberArg(args, '--manual-min-bid-until-epoch') ?? getOptionalEnvNumber('MANUAL_MIN_BID_UNTIL_EPOCH');
 
 const LOG_FILE        = rel(get('LOG_FILE',   'logging.logFile',   './bid-bot.log'));
 const STATE_FILE      = rel(get('STATE_FILE', 'logging.stateFile', './bid-bot.state'));
@@ -87,7 +109,6 @@ const VALIDATOR_NAME_LOOKUP_URL = 'https://validators-api.marinade.finance/valid
 const VALIDATOR_NAME_TIMEOUT_MS = +get('VALIDATOR_NAME_TIMEOUT_MS', 'runtime.validatorNameTimeoutMs', 10000);
 const FILL_RANK_DISCORD_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 
-const args = process.argv.slice(2);
 function resolveMode(argv) {
   if (argv.includes('--setup')) return 'setup';
   if (argv.includes('--status')) return 'status';
@@ -99,14 +120,7 @@ const FILL_RANK_REQUESTED = args.includes('--fill-rank');
 const MODE = resolveMode(args);
 const FORCE_REFRESH = args.includes('--force-refresh');
 const FORCE_DRY     = args.includes('--dry-run');
-function readNumberArg(name, defaultValue) {
-  const inline = args.find(arg => arg.startsWith(`${name}=`));
-  if (inline) return Number(inline.slice(name.length + 1));
-  const index = args.indexOf(name);
-  if (index >= 0 && args[index + 1] != null) return Number(args[index + 1]);
-  return defaultValue;
-}
-const FILL_RANK_LIMIT = readNumberArg('--rank-limit', 9);
+const FILL_RANK_LIMIT = readNumberArg(args, '--rank-limit', 9);
 const dryRunActive  = DRY_RUN || FORCE_DRY;
 const verboseLogs   = dryRunActive;
 const showCalculationTable = dryRunActive || MODE === 'loop';
@@ -254,8 +268,18 @@ function formatBidCalculationTable(status, onchainBid, targetBid, opts = {}) {
     ['Penalty', fmtPenalty(status.bidTooLowPenalty)],
     ['SAM Target', fmtSol(status.samTargetSol)],
   ];
+  const insertBeforeTarget = row => {
+    const index = rows.findIndex(([label]) => label === 'Target Bid');
+    rows.splice(index >= 0 ? index : 8, 0, row);
+  };
   if (Number.isFinite(opts.recentMinFloor) && opts.recentMinFloor > 0) {
-    rows.splice(8, 0, [`Recent${RECENT_MIN_LOOKBACK_EPOCHS}MinFloor`, fmtPmpe(opts.recentMinFloor)]);
+    insertBeforeTarget([`Recent${RECENT_MIN_LOOKBACK_EPOCHS}MinFloor`, fmtPmpe(opts.recentMinFloor)]);
+  }
+  if (Number.isFinite(opts.manualBidFloor) && opts.manualBidFloor > 0) {
+    const until = Number.isFinite(opts.manualBidFloorUntilEpoch)
+      ? ` (until epoch ${opts.manualBidFloorUntilEpoch})`
+      : '';
+    insertBeforeTarget(['Manual Floor', `${fmtPmpe(opts.manualBidFloor)}${until}`]);
   }
   if (opts.includeMinChange) {
     rows.splice(rows.findIndex(r => r[0] === 'Delta'), 0, ['Min Change', fmtPmpe(MIN_BID_CHANGE_PMPE)]);
@@ -306,6 +330,14 @@ function findValidatorNameByVoteAccount(data, voteAccount) {
 function formatDiscordContent(content, validatorName = discordValidatorLabel) {
   const label = cleanValidatorName(validatorName);
   return label ? `[${label}] ${content}` : content;
+}
+function escapeXml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
 }
 function formatDiscordCodeBlockMessages(title, body, opts = {}) {
   const maxChars = opts.maxChars ?? 1800;
@@ -372,12 +404,33 @@ async function initDiscordValidatorLabel() {
 async function notifyDiscord(content) {
   if (!DISCORD_WEBHOOK) return;
   try {
-    await fetch(DISCORD_WEBHOOK, {
+    const resp = await fetch(DISCORD_WEBHOOK, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content: formatDiscordContent(content) }),
     });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${(await resp.text()).slice(0, 500)}`);
   } catch (e) { log(`Discord 알림을 보내지 못했습니다. 이유: ${e.message}`); }
+}
+
+async function notifyDiscordImage(content, filename, imageBuffer, mimeType = 'image/png') {
+  if (!DISCORD_WEBHOOK) return false;
+  try {
+    const form = new FormData();
+    form.append('payload_json', JSON.stringify({
+      content: formatDiscordContent(content),
+    }));
+    form.append('files[0]', new Blob([imageBuffer], { type: mimeType }), filename);
+    const resp = await fetch(DISCORD_WEBHOOK, {
+      method: 'POST',
+      body: form,
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${(await resp.text()).slice(0, 500)}`);
+    return true;
+  } catch (e) {
+    log(`Discord 이미지 알림을 보내지 못했습니다. 이유: ${e.message}`);
+    return false;
+  }
 }
 
 function which(cmd) {
@@ -828,9 +881,104 @@ function formatFillRankTable(result) {
   return `${summary}\n\n${table}`;
 }
 
-function readFillRankTable(limit = FILL_RANK_LIMIT) {
+function formatFillRankImageSvg(result, opts = {}) {
+  const marginX = 34;
+  const titleY = 46;
+  const summaryY = 90;
+  const tableTop = 132;
+  const headerHeight = 58;
+  const rowHeight = 44;
+  const bottomPad = 34;
+  const columns = [
+    { label: ['Rank'], width: 70, align: 'right', value: row => row.rank },
+    { label: ['Vote'], width: 180, align: 'left', value: row => fmtAccount(row.voteAccount) },
+    { label: ['Stake', 'Priority'], width: 118, align: 'right', value: row => row.stakePriority },
+    { label: ['Target'], width: 138, align: 'right', value: row => fmtSol0(row.target) },
+    { label: ['Active'], width: 138, align: 'right', value: row => fmtSol0(row.active) },
+    { label: ['Need'], width: 146, align: 'right', value: row => fmtSol0(row.need) },
+    { label: ['Fill', 'Expected'], width: 150, align: 'right', value: row => fmtSol0(row.fill) },
+    { label: ['Fill'], width: 82, align: 'right', value: row => fmtPct0(row.fillPct) },
+    { label: ['Bid'], width: 96, align: 'right', value: row => fmt4(row.bidPmpe) },
+    { label: ['Bid', '@5/0'], width: 112, align: 'right', value: row => fmt4(row.normalizedBidPmpe) },
+  ];
+  const tableWidth = columns.reduce((sum, col) => sum + col.width, 0);
+  const width = tableWidth + marginX * 2;
+  const height = tableTop + headerHeight + result.rows.length * rowHeight + bottomPad;
+  const title = opts.title ?? `fill-rank --rank-limit ${result.rows.length}`;
+  const reason = opts.reason ? ` / ${opts.reason}` : '';
+  const summary = [
+    `Epoch ${result.epoch}`,
+    `Re-delegate budget ${fmtSol0(result.redelegateBudget)} SOL`,
+    `Receivers ${result.receiverCount}`,
+  ].join('   ');
+
+  let x = marginX;
+  const columnPositions = columns.map((col) => {
+    const pos = { ...col, x };
+    x += col.width;
+    return pos;
+  });
+  const text = (value, xPos, yPos, attrs = '') => (
+    `<text x="${xPos}" y="${yPos}" ${attrs}>${escapeXml(value)}</text>`
+  );
+  const cellText = (value, col, yPos, attrs = '') => {
+    const pad = 16;
+    const anchor = col.align === 'right' ? 'end' : 'start';
+    const xPos = col.align === 'right' ? col.x + col.width - pad : col.x + pad;
+    return text(value, xPos, yPos, `text-anchor="${anchor}" ${attrs}`);
+  };
+  const headerCells = columnPositions.flatMap(col => {
+    const firstY = tableTop + 23;
+    const lineGap = 22;
+    return col.label.map((line, index) => (
+      cellText(line, col, firstY + index * lineGap, 'class="header-text"')
+    ));
+  }).join('\n');
+  const rowGroups = result.rows.map((row, rowIndex) => {
+    const y = tableTop + headerHeight + rowIndex * rowHeight;
+    const fillWidth = Math.max(0, Math.min(1, row.fillPct ?? 0)) * tableWidth;
+    const cells = columnPositions.map(col => (
+      cellText(col.value(row), col, y + 29, 'class="body-text"')
+    )).join('\n');
+    return `
+      <rect x="${marginX}" y="${y}" width="${tableWidth}" height="${rowHeight}" fill="${rowIndex % 2 === 0 ? '#ffffff' : '#f8fafc'}"/>
+      <rect x="${marginX}" y="${y}" width="${fillWidth.toFixed(2)}" height="${rowHeight}" fill="#dcfce7" opacity="0.55"/>
+      ${cells}
+      <line x1="${marginX}" y1="${y + rowHeight}" x2="${marginX + tableWidth}" y2="${y + rowHeight}" stroke="#e2e8f0" stroke-width="1"/>
+    `;
+  }).join('\n');
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+  <style>
+    .title { font: 700 30px Inter, Arial, sans-serif; fill: #0f172a; }
+    .summary { font: 500 22px Inter, Arial, sans-serif; fill: #334155; }
+    .header-text { font: 700 20px Inter, Arial, sans-serif; fill: #334155; }
+    .body-text { font: 500 22px Inter, Arial, sans-serif; fill: #0f172a; }
+  </style>
+  <rect width="100%" height="100%" rx="22" fill="#f1f5f9"/>
+  <rect x="16" y="16" width="${width - 32}" height="${height - 32}" rx="18" fill="#ffffff" stroke="#cbd5e1"/>
+  ${text(`${title}${reason}`, marginX, titleY, 'class="title"')}
+  ${text(summary, marginX, summaryY, 'class="summary"')}
+  <rect x="${marginX}" y="${tableTop}" width="${tableWidth}" height="${headerHeight}" rx="10" fill="#e2e8f0"/>
+  ${headerCells}
+  <line x1="${marginX}" y1="${tableTop + headerHeight}" x2="${marginX + tableWidth}" y2="${tableTop + headerHeight}" stroke="#cbd5e1" stroke-width="2"/>
+  ${rowGroups}
+</svg>`;
+}
+
+async function renderFillRankImagePng(result, opts = {}) {
+  const svg = formatFillRankImageSvg(result, opts);
+  return sharp(Buffer.from(svg)).png().toBuffer();
+}
+
+function readFillRankResult(limit = FILL_RANK_LIMIT) {
   const data = JSON.parse(readFileSync(`${OUTPUT_DIR}/results.json`, 'utf8'));
-  return formatFillRankTable(computeFillRankRowsFromResults(data, { limit }));
+  return computeFillRankRowsFromResults(data, { limit });
+}
+
+function readFillRankTable(limit = FILL_RANK_LIMIT) {
+  return formatFillRankTable(readFillRankResult(limit));
 }
 
 function shouldCheckScheduledFillRankReport(nowMs, lastCheckedMs, intervalMs = FILL_RANK_DISCORD_CHECK_INTERVAL_MS) {
@@ -841,9 +989,22 @@ function hasFillRankTableChanged(currentTable, lastSentTable) {
   return lastSentTable == null || currentTable !== lastSentTable;
 }
 
-async function notifyFillRankReportToDiscord(reason, table = readFillRankTable(FILL_RANK_LIMIT)) {
+async function notifyFillRankReportToDiscord(reason, table = readFillRankTable(FILL_RANK_LIMIT), result = readFillRankResult(FILL_RANK_LIMIT)) {
   const title = `📊 \`bid-bot\`: fill-rank --rank-limit ${FILL_RANK_LIMIT}${reason ? ` (${reason})` : ''}`;
-  for (const message of formatDiscordCodeBlockMessages(title, table)) {
+  const filename = `bid-bot-fill-rank-epoch-${result.epoch ?? 'unknown'}-top-${FILL_RANK_LIMIT}.png`;
+  const reasonLabel = reason === '시작 알림' ? 'start' : reason === '변경 감지' ? 'changed' : reason;
+  try {
+    const imageBuffer = await renderFillRankImagePng(result, {
+      title: `fill-rank --rank-limit ${FILL_RANK_LIMIT}`,
+      reason: reasonLabel,
+    });
+    if (await notifyDiscordImage(title, filename, imageBuffer)) {
+      return;
+    }
+  } catch (e) {
+    log(`fill-rank 이미지를 만들지 못해 text table로 fallback합니다. 이유: ${e.message}`);
+  }
+  for (const message of formatDiscordCodeBlockMessages(`${title} (image upload failed)`, table)) {
     await notifyDiscord(message);
   }
 }
@@ -855,11 +1016,26 @@ function computeTargetBid(effPart, strategy = {}) {
   const permittedDev = strategy.permittedDev ?? PERMITTED_DEV;
   const winBufferPmpe = strategy.winBufferPmpe ?? WIN_BUFFER_PMPE;
   const safetyRatio = strategy.safetyRatio ?? SAFETY_RATIO;
-  const recentMinFloor = strategy.recentMinFloor ?? 0;
+  const recentMinFloor = Number.isFinite(strategy.recentMinFloor) ? strategy.recentMinFloor : 0;
+  const manualBidFloor = Number.isFinite(strategy.manualBidFloor) ? strategy.manualBidFloor : 0;
   const safeFloor    = effPart * (1 - permittedDev);
   const winningFloor = effPart + winBufferPmpe;
   const conservative = effPart * safetyRatio;
-  return +Math.max(safeFloor, winningFloor, conservative, recentMinFloor).toFixed(4);
+  return +Math.max(safeFloor, winningFloor, conservative, recentMinFloor, manualBidFloor).toFixed(4);
+}
+
+function resolveManualBidFloor(currentEpoch, opts = {}) {
+  const floor = opts.manualMinBidPmpe ?? MANUAL_MIN_BID_PMPE;
+  const untilEpoch = opts.manualMinBidUntilEpoch ?? MANUAL_MIN_BID_UNTIL_EPOCH;
+  const normalizedUntil = Number.isFinite(untilEpoch) ? untilEpoch : null;
+
+  if (!Number.isFinite(floor) || floor <= 0) {
+    return { floor: 0, active: false, expired: false, untilEpoch: normalizedUntil };
+  }
+  if (normalizedUntil != null && Number.isFinite(currentEpoch) && currentEpoch > normalizedUntil) {
+    return { floor: 0, active: false, expired: true, untilEpoch: normalizedUntil };
+  }
+  return { floor, active: true, expired: false, untilEpoch: normalizedUntil };
 }
 
 // scoring.marinade.finance SAM API 응답에서 내 validator의 epoch별 effParticipatingBidPmpe를 추출
@@ -1061,8 +1237,15 @@ async function runOnce() {
   if (recentMinFloor > 0) {
     logVerbose(`최근 ${RECENT_MIN_LOOKBACK_EPOCHS} 에폭 내 effParticipatingBidPmpe 최소값 × ${RECENT_MIN_MULTIPLIER} = ${fmtPmpe(recentMinFloor)}를 floor로 적용합니다.`);
   }
+  const manualBidFloor = resolveManualBidFloor(status.epoch);
+  if (manualBidFloor.expired) {
+    logVerbose(`수동 bid floor는 epoch ${manualBidFloor.untilEpoch}까지만 적용되도록 설정되어 있어 현재 epoch ${status.epoch}에서는 사용하지 않습니다.`);
+  }
 
-  let target = computeTargetBid(status.effPart, { recentMinFloor });
+  let target = computeTargetBid(status.effPart, {
+    recentMinFloor,
+    manualBidFloor: manualBidFloor.floor,
+  });
   if (!isTargetInSanityRange(target)) {
     log(`⚠️ 계산된 목표 bid ${fmtPmpe(target)}가 안전 범위(${fmtPmpe(MIN_SANITY_BID)}~${fmtPmpe(MAX_SANITY_BID)}) 밖이라 변경하지 않습니다.`);
     return true;
@@ -1089,6 +1272,8 @@ async function runOnce() {
       log(formatBidCalculationTable(status, onchain.bid, target, {
         includeMinChange: dryRunActive,
         recentMinFloor,
+        manualBidFloor: manualBidFloor.floor,
+        manualBidFloorUntilEpoch: manualBidFloor.untilEpoch,
       }));
       log(`변경 기준(${fmtPmpe(MIN_BID_CHANGE_PMPE)})보다 차이가 작아서 이번에는 bid를 유지합니다.`);
     } else {
@@ -1116,11 +1301,15 @@ async function runOnce() {
     log(formatBidCalculationTable(status, onchain.bid, target, {
       includeMinChange: dryRunActive,
       recentMinFloor,
+      manualBidFloor: manualBidFloor.floor,
+      manualBidFloorUntilEpoch: manualBidFloor.untilEpoch,
       title: MODE === 'loop' ? '계산 결과' : undefined,
     }));
   } else {
     log(formatBidCalculationTable(status, onchain.bid, target, {
       recentMinFloor,
+      manualBidFloor: manualBidFloor.floor,
+      manualBidFloorUntilEpoch: manualBidFloor.untilEpoch,
       title: 'bid 변경 계산',
     }));
   }
@@ -1151,14 +1340,18 @@ export {
   formatDiscordCodeBlockMessages,
   formatDiscordContent,
   formatBidCalculationTable,
+  formatFillRankImageSvg,
   formatFillRankTable,
   fmtDuration,
   isTargetInSanityRange,
   parseCpmpeBid,
   patchDsSamSdkForPrereleaseVersions,
   pmpeToCpmpeLamports,
+  readOptionalNumberArg,
   refreshHeavyFiles,
+  renderFillRankImagePng,
   hasFillRankTableChanged,
+  resolveManualBidFloor,
   resolveMode,
   shouldChangeBid,
   shouldCheckScheduledFillRankReport,
@@ -1202,7 +1395,7 @@ async function main() {
       log(`epoch-aware loop가 켜져 있습니다. Solana epoch 종료가 ${fmtDuration(EPOCH_FAST_THRESHOLD_SECONDS)} 이내로 다가오면 최대 ${fmtDuration(EPOCH_FAST_INTERVAL / 1000)}마다 확인합니다.`);
     }
     if (loopFillRankReports) {
-      log(`fill-rank Discord 알림이 켜져 있습니다. 첫 회차 계산 후 1회 전송하고, 이후 ${fmtDuration(FILL_RANK_DISCORD_CHECK_INTERVAL_MS / 1000)}마다 표 변경 여부를 확인합니다.`);
+      log(`fill-rank Discord 알림이 켜져 있습니다. 첫 회차 계산 후 1회 이미지로 전송하고, 이후 ${fmtDuration(FILL_RANK_DISCORD_CHECK_INTERVAL_MS / 1000)}마다 표 변경 여부를 확인합니다.`);
       if (!DISCORD_WEBHOOK) {
         log('⚠️ discordWebhook이 비어 있어 fill-rank 표를 Discord로 보낼 수 없습니다.');
       }
@@ -1227,7 +1420,7 @@ async function main() {
             lastFillRankTable = table;
             if (DISCORD_WEBHOOK) {
               await notifyFillRankReportToDiscord(reason, table);
-              log(`fill-rank 표 변경을 감지해 Discord로 보냈습니다. 다음 변경 확인은 ${fmtDuration(FILL_RANK_DISCORD_CHECK_INTERVAL_MS / 1000)} 후입니다.`);
+              log(`fill-rank 표 변경을 감지해 Discord 이미지로 보냈습니다. 다음 변경 확인은 ${fmtDuration(FILL_RANK_DISCORD_CHECK_INTERVAL_MS / 1000)} 후입니다.`);
             }
           }
         } catch (e) {

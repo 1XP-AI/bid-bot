@@ -28,7 +28,7 @@ Marinade SAM 자동 bid 관리 봇. 로컬에서 ds-sam SDK를 직접 실행해 
 ```bash
 git clone https://github.com/1XP-AI/bid-bot.git
 cd bid-bot
-npm install        # (의존성 없음, package.json 메타데이터만)
+npm install        # Discord fill-rank 이미지 생성용 sharp 포함
 
 # validator-bonds CLI 설치. bid 인하 적용에는 --force 지원 버전이 필요함.
 npm install -g @marinade.finance/validator-bonds-cli@latest
@@ -64,6 +64,14 @@ chmod +x bid-bot.js
 | `node bid-bot.js --loop` | 계속 실행하면서 주기적으로 bid 점검 | `runtime.dryRun=false`이면 있음 |
 
 `--force-refresh`를 함께 붙이면 24시간 캐시를 무시하고 ds-sam 입력 파일을 다시 받습니다. 예: `node bid-bot.js --fill-rank --rank-limit 20 --force-refresh`.
+
+수동으로 맞춘 bid를 이번 epoch 동안 봇이 낮추지 않게 하려면 manual floor flag를 붙입니다.
+
+```bash
+node bid-bot.js --loop --fill-rank --rank-limit 9 \
+  --manual-min-bid-pmpe 0.1049 \
+  --manual-min-bid-until-epoch 981
+```
 
 ### 1. 첫 실행 - ds-sam 자동 설치
 
@@ -120,7 +128,7 @@ node bid-bot.js --fill-rank --rank-limit 9
 
 live bonds API를 반영해 ds-sam을 다시 계산한 뒤, `stakePriority` 오름차순으로 정렬하고 `SAM Target - SAM Active > 0`인 validator만 보여줍니다. `Fill 예상`은 대시보드의 `Stake To Distribute`와 같은 기준인 `SAM TVL - Active 합계` budget으로 계산합니다. `Bid @5/0`은 모든 validator를 commission 5%, tip/MEV commission 0% 기준으로 맞췄을 때의 환산 bid입니다.
 
-`--loop --fill-rank --rank-limit 9`로 실행하면 일반 bid loop를 유지하면서 첫 회차 계산 후 한 번 fill-rank 표를 Discord로 보냅니다. 이후에는 매시간 표를 다시 계산하고, 이전에 보낸 표와 달라진 경우에만 다시 보냅니다. Discord 메시지는 고정폭 표가 깨지지 않도록 `text` code block으로 전송합니다. `logging.discordWebhook`이 비어 있으면 표를 보낼 수 없습니다.
+`--loop --fill-rank --rank-limit 9`로 실행하면 일반 bid loop를 유지하면서 첫 회차 계산 후 한 번 fill-rank 표를 Discord로 보냅니다. 이후에는 매시간 표를 다시 계산하고, 이전에 보낸 표와 달라진 경우에만 다시 보냅니다. Discord에는 모바일에서도 표가 깨지지 않도록 PNG 이미지 attachment로 전송합니다. 이미지 생성이나 업로드가 실패하면 기존 `text` code block 표로 fallback합니다. `logging.discordWebhook`이 비어 있으면 표를 보낼 수 없습니다.
 
 예시:
 
@@ -339,16 +347,26 @@ BID_BOT_CONFIG=/path/to/my-bid-bot.json node bid-bot.js --dry-run
 
 ```
 recentMinFloor = 최근 N epoch 내 effParticipatingBidPmpe 최저값 x multiplier
+manualMinBidFloor = --manual-min-bid-pmpe, 단 만료 epoch이 없거나 현재 epoch <= --manual-min-bid-until-epoch일 때만
 
 target = max(
   effPart × (1 - permittedDev),    // 페널티 0 floor
   effPart + winBufferPmpe,         // winning 유지 floor
   effPart × safetyRatio,           // 안전 buffer
-  recentMinFloor                   // bid-too-low 페널티 방지 floor
+  recentMinFloor,                  // bid-too-low 페널티 방지 floor
+  manualMinBidFloor                // 임시 수동 floor
 )
 ```
 
-네 floor 중 가장 높은 값을 목표 bid로 잡습니다. `recentMinFloor`는 최근 epoch 기준으로 너무 급하게 낮추다가 bid-too-low 페널티를 받는 상황을 막기 위한 추가 안전장치입니다.
+다섯 floor 중 가장 높은 값을 목표 bid로 잡습니다. `recentMinFloor`는 최근 epoch 기준으로 너무 급하게 낮추다가 bid-too-low 페널티를 받는 상황을 막기 위한 추가 안전장치입니다. `--manual-min-bid-pmpe`는 운영자가 특정 epoch에서 stake fill을 받기 위해 직접 정한 bid를 봇이 다시 낮추지 못하게 하는 임시 안전장치입니다.
+
+이번 epoch 동안 수동으로 `0.1049 PMPE`를 유지해야 한다면 실행 명령에 아래 flag를 붙이세요. 예시는 epoch 981까지 적용됩니다.
+
+```bash
+--manual-min-bid-pmpe 0.1049 --manual-min-bid-until-epoch 981
+```
+
+이 flag는 target을 `0.1049 PMPE` 아래로 내리지 않는 하한선입니다. 자동 계산 target이 `0.1049`보다 높으면 봇은 더 높은 값으로 올릴 수 있습니다. `--manual-min-bid-until-epoch`가 지나면 하한선은 자동으로 무시됩니다.
 
 이 스크립트가 on-chain에 적용하는 값은 `validator-bonds configure-bond --cpmpe ...`뿐입니다. `--max-stake-wanted`는 변경하지 않습니다.
 
@@ -379,7 +397,7 @@ receivers = validators
 6. 모드별 처리
    - --status: 내 validator JSON 출력 후 종료
    - --fill-rank: live fill 순위표 출력 후 종료
-   - --loop --fill-rank: 일반 loop를 유지하고 시작 시 1회, 이후 매시간 변경된 fill-rank 표만 Discord로 전송
+   - --loop --fill-rank: 일반 loop를 유지하고 시작 시 1회, 이후 매시간 변경된 fill-rank 표 이미지만 Discord로 전송
    - run/loop/dry-run: target bid 계산
 7. bond account resolve 후 on-chain 현재 cpmpe와 비교
 8. 차이 의미 있으면 validator-bonds configure-bond --cpmpe로 적용
