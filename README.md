@@ -59,6 +59,7 @@ chmod +x bid-bot.js
 | `node bid-bot.js --dry-run` | 실제 적용 없이 계산과 적용 명령만 확인 | 없음 |
 | `node bid-bot.js --status` | 내 validator의 ds-sam 계산 결과를 JSON으로 출력 | 없음 |
 | `node bid-bot.js --fill-rank --rank-limit 9` | live bonds 기준 stake fill 예상 순위표 출력 | 없음 |
+| `node bid-bot.js --loop --fill-rank --rank-limit 9` | 일반 loop 실행 + fill-rank 표를 Discord로 정기 전송 | `runtime.dryRun=false`이면 있음 |
 | `node bid-bot.js` | 1회 계산 후 필요하면 bid 적용 | `runtime.dryRun=false`이면 있음 |
 | `node bid-bot.js --loop` | 계속 실행하면서 주기적으로 bid 점검 | `runtime.dryRun=false`이면 있음 |
 
@@ -118,6 +119,8 @@ node bid-bot.js --fill-rank --rank-limit 9
 ```
 
 live bonds API를 반영해 ds-sam을 다시 계산한 뒤, `stakePriority` 오름차순으로 정렬하고 `SAM Target - SAM Active > 0`인 validator만 보여줍니다. `Fill 예상`은 대시보드의 `Stake To Distribute`와 같은 기준인 `SAM TVL - Active 합계` budget으로 계산합니다. `Bid @5/0`은 모든 validator를 commission 5%, tip/MEV commission 0% 기준으로 맞췄을 때의 환산 bid입니다.
+
+`--loop --fill-rank --rank-limit 9`로 실행하면 일반 bid loop를 유지하면서 첫 회차 계산 후 한 번 fill-rank 표를 Discord로 보냅니다. 이후에는 매시간 표를 다시 계산하고, 이전에 보낸 표와 달라진 경우에만 다시 보냅니다. Discord 메시지는 고정폭 표가 깨지지 않도록 `text` code block으로 전송합니다. `logging.discordWebhook`이 비어 있으면 표를 보낼 수 없습니다.
 
 예시:
 
@@ -375,6 +378,7 @@ receivers = validators
 6. 모드별 처리
    - --status: 내 validator JSON 출력 후 종료
    - --fill-rank: live fill 순위표 출력 후 종료
+   - --loop --fill-rank: 일반 loop를 유지하고 시작 시 1회, 이후 매시간 변경된 fill-rank 표만 Discord로 전송
    - run/loop/dry-run: target bid 계산
 7. bond account resolve 후 on-chain 현재 cpmpe와 비교
 8. 차이 의미 있으면 validator-bonds configure-bond --cpmpe로 적용

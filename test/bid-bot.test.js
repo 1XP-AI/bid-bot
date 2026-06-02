@@ -10,16 +10,20 @@ import {
   computeTargetBid,
   extractMyStatusFromResults,
   findValidatorNameByVoteAccount,
+  formatDiscordCodeBlockMessages,
   formatDiscordContent,
   formatBidCalculationTable,
   formatFillRankTable,
   fmtDuration,
+  hasFillRankTableChanged,
   isTargetInSanityRange,
   parseCpmpeBid,
   patchDsSamSdkForPrereleaseVersions,
   pmpeToCpmpeLamports,
   refreshHeavyFiles,
+  resolveMode,
   shouldChangeBid,
+  shouldCheckScheduledFillRankReport,
 } from '../bid-bot.js';
 
 test('computeTargetBid keeps the highest safety floor and rounds to 4 decimals', () => {
@@ -207,6 +211,12 @@ test('human-readable duration keeps hour and minute boundaries stable', () => {
   assert.equal(fmtDuration(42), '42초');
 });
 
+test('loop mode wins when fill-rank is requested with loop', () => {
+  assert.equal(resolveMode(['--loop', '--fill-rank', '--rank-limit', '9']), 'loop');
+  assert.equal(resolveMode(['--fill-rank', '--rank-limit', '9', '--loop']), 'loop');
+  assert.equal(resolveMode(['--fill-rank', '--rank-limit', '9']), 'fill-rank');
+});
+
 test('bid change table shows dynamic values without fixed config thresholds by default', () => {
   const status = {
     epoch: 968,
@@ -315,6 +325,37 @@ test('fill-rank table uses redelegation budget and keeps SOL columns whole-numbe
   assert.match(table, /\b1\s+rank-one\s+10\s+450\s+300\s+150\s+150\s+100%\s+0\.3010\s+0\.3160\s+BOND/);
   assert.match(table, /\b2\s+rank-two\s+20\s+700\s+100\s+600\s+200\s+33%\s+0\.1500\s+0\.1300\s+WANT/);
   assert.doesNotMatch(table, /\|/);
+});
+
+test('scheduled fill-rank report checks immediately and then every hour', () => {
+  const oneHour = 60 * 60 * 1000;
+
+  assert.equal(shouldCheckScheduledFillRankReport(1_000, null, oneHour), true);
+  assert.equal(shouldCheckScheduledFillRankReport(1_000 + oneHour - 1, 1_000, oneHour), false);
+  assert.equal(shouldCheckScheduledFillRankReport(1_000 + oneHour, 1_000, oneHour), true);
+});
+
+test('fill-rank Discord report sends only when the table changes', () => {
+  const table = 'Rank  Vote\n   1  A11pGb...KtS5';
+
+  assert.equal(hasFillRankTableChanged(table, null), true);
+  assert.equal(hasFillRankTableChanged(table, table), false);
+  assert.equal(hasFillRankTableChanged(`${table}\n   2  HHLMTH...ubgq`, table), true);
+});
+
+test('Discord fill-rank messages wrap fixed-width tables in code blocks', () => {
+  const table = [
+    'Rank  Vote           Stake Priority',
+    '----  -------------  --------------',
+    '   1  A11pGb...KtS5              14',
+  ].join('\n');
+
+  const [message] = formatDiscordCodeBlockMessages('📊 `bid-bot`: fill-rank --rank-limit 9', table);
+
+  assert.match(message, /^📊 `bid-bot`: fill-rank --rank-limit 9\n```text\n/);
+  assert.match(message, /Rank  Vote           Stake Priority/);
+  assert.match(message, /   1  A11pGb\.\.\.KtS5              14/);
+  assert.match(message, /\n```$/);
 });
 
 test('refreshHeavyFiles reports failed heavy inputs before calculation can continue', async () => {

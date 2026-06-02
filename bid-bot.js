@@ -6,6 +6,7 @@
 //   node bid-bot.js --setup      # ds-sam clone + install (자동)
 //   node bid-bot.js --status     # 현재 상태만 JSON 출력
 //   node bid-bot.js --fill-rank  # live 재계산 기준 stake fill 순위표
+//   node bid-bot.js --loop --fill-rank --rank-limit 9  # loop 중 Discord fill-rank 알림
 //   node bid-bot.js --dry-run    # 변경 시뮬레이션만
 //   node bid-bot.js --loop       # 무한 루프
 //   node bid-bot.js --force-refresh  # heavy 캐시 강제 갱신
@@ -84,13 +85,18 @@ const EPOCH_FAST_INTERVAL = +get('EPOCH_FAST_INTERVAL_SECONDS', 'runtime.epochAw
 const EPOCH_RPC_TIMEOUT_MS = +get('EPOCH_RPC_TIMEOUT_MS', 'runtime.epochAware.rpcTimeoutMs', 10000);
 const VALIDATOR_NAME_LOOKUP_URL = 'https://validators-api.marinade.finance/validators?epochs=1&limit=1000000';
 const VALIDATOR_NAME_TIMEOUT_MS = +get('VALIDATOR_NAME_TIMEOUT_MS', 'runtime.validatorNameTimeoutMs', 10000);
+const FILL_RANK_DISCORD_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 
 const args = process.argv.slice(2);
-const MODE = args.includes('--setup')  ? 'setup'
-           : args.includes('--status') ? 'status'
-           : args.includes('--fill-rank') ? 'fill-rank'
-           : args.includes('--loop')   ? 'loop'
-           : 'run';
+function resolveMode(argv) {
+  if (argv.includes('--setup')) return 'setup';
+  if (argv.includes('--status')) return 'status';
+  if (argv.includes('--loop')) return 'loop';
+  if (argv.includes('--fill-rank')) return 'fill-rank';
+  return 'run';
+}
+const FILL_RANK_REQUESTED = args.includes('--fill-rank');
+const MODE = resolveMode(args);
 const FORCE_REFRESH = args.includes('--force-refresh');
 const FORCE_DRY     = args.includes('--dry-run');
 function readNumberArg(name, defaultValue) {
@@ -104,6 +110,7 @@ const FILL_RANK_LIMIT = readNumberArg('--rank-limit', 9);
 const dryRunActive  = DRY_RUN || FORCE_DRY;
 const verboseLogs   = dryRunActive;
 const showCalculationTable = dryRunActive || MODE === 'loop';
+const loopFillRankReports = MODE === 'loop' && FILL_RANK_REQUESTED;
 let discordValidatorLabel = '';
 
 // ============================================================
@@ -293,6 +300,31 @@ function findValidatorNameByVoteAccount(data, voteAccount) {
 function formatDiscordContent(content, validatorName = discordValidatorLabel) {
   const label = cleanValidatorName(validatorName);
   return label ? `[${label}] ${content}` : content;
+}
+function formatDiscordCodeBlockMessages(title, body, opts = {}) {
+  const maxChars = opts.maxChars ?? 1800;
+  const lines = String(body ?? '').split('\n');
+  const messages = [];
+  let chunk = [];
+
+  const render = (part, index) => {
+    const suffix = index > 0 ? ` (${index + 1})` : '';
+    return `${title}${suffix}\n\`\`\`text\n${part.join('\n')}\n\`\`\``;
+  };
+
+  for (const line of lines) {
+    const candidate = [...chunk, line];
+    if (chunk.length > 0 && render(candidate, messages.length).length > maxChars) {
+      messages.push(render(chunk, messages.length));
+      chunk = [line];
+    } else {
+      chunk = candidate;
+    }
+  }
+  if (chunk.length > 0) {
+    messages.push(render(chunk, messages.length));
+  }
+  return messages;
 }
 
 function readCachedValidatorName(voteAccount) {
@@ -791,6 +823,26 @@ function formatFillRankTable(result) {
   return `${summary}\n\n${table}`;
 }
 
+function readFillRankTable(limit = FILL_RANK_LIMIT) {
+  const data = JSON.parse(readFileSync(`${OUTPUT_DIR}/results.json`, 'utf8'));
+  return formatFillRankTable(computeFillRankRowsFromResults(data, { limit }));
+}
+
+function shouldCheckScheduledFillRankReport(nowMs, lastCheckedMs, intervalMs = FILL_RANK_DISCORD_CHECK_INTERVAL_MS) {
+  return lastCheckedMs == null || nowMs - lastCheckedMs >= intervalMs;
+}
+
+function hasFillRankTableChanged(currentTable, lastSentTable) {
+  return lastSentTable == null || currentTable !== lastSentTable;
+}
+
+async function notifyFillRankReportToDiscord(reason, table = readFillRankTable(FILL_RANK_LIMIT)) {
+  const title = `📊 \`bid-bot\`: fill-rank --rank-limit ${FILL_RANK_LIMIT}${reason ? ` (${reason})` : ''}`;
+  for (const message of formatDiscordCodeBlockMessages(title, table)) {
+    await notifyDiscord(message);
+  }
+}
+
 // ============================================================
 // bid 결정 + 적용
 // ============================================================
@@ -965,33 +1017,32 @@ async function runOnce() {
 
   if (!(await fetchLiveBonds())) {
     await notifyDiscord('❌ `bid-bot`: 최신 bond 입찰 데이터를 받지 못해 이번 회차를 중단했습니다. 오래된 cache로는 적용하지 않습니다.');
-    return;
+    return false;
   }
   if (!(await fetchHeavyIfStale(FORCE_REFRESH))) {
     await notifyDiscord('❌ `bid-bot`: 검증용 보조 데이터 갱신 실패. 오래된 cache로는 계산하지 않고 이번 회차를 중단했습니다.');
-    return;
+    return false;
   }
 
   if (!runDsSam()) {
     await notifyDiscord('❌ `bid-bot`: Marinade SAM 경매 계산이 실패해 이번 회차를 중단했습니다.');
-    return;
+    return false;
   }
 
   const status = extractMyStatus();
   if (!status) {
     log('❌ 내 validator가 이번 SAM 경매 결과에 없습니다. vote account와 validator eligibility를 확인해야 합니다.');
     await notifyDiscord(`🚨 \`bid-bot\`: validator ${fmtAccount(VOTE_ADDR)}가 이번 SAM 경매 결과에 없습니다.`);
-    return;
+    return true;
   }
 
   if (MODE === 'status') {
     console.log(JSON.stringify(status, null, 2));
-    return;
+    return true;
   }
   if (MODE === 'fill-rank') {
-    const data = JSON.parse(readFileSync(`${OUTPUT_DIR}/results.json`, 'utf8'));
-    console.log(formatFillRankTable(computeFillRankRowsFromResults(data, { limit: FILL_RANK_LIMIT })));
-    return;
+    console.log(readFillRankTable(FILL_RANK_LIMIT));
+    return true;
   }
 
   // samEligible 체크는 비활성화되었습니다 (사용자 요청).
@@ -1009,14 +1060,14 @@ async function runOnce() {
   let target = computeTargetBid(status.effPart, { recentMinFloor });
   if (!isTargetInSanityRange(target)) {
     log(`⚠️ 계산된 목표 bid ${fmtPmpe(target)}가 안전 범위(${fmtPmpe(MIN_SANITY_BID)}~${fmtPmpe(MAX_SANITY_BID)}) 밖이라 변경하지 않습니다.`);
-    return;
+    return true;
   }
 
   const bondAccount = resolveBondAccount();
   if (!bondAccount) {
     log('❌ bond account를 찾지 못해 on-chain 상태를 확인할 수 없습니다.');
     await notifyDiscord('❌ `bid-bot`: bond account 조회에 실패해 이번 회차를 중단했습니다.');
-    return;
+    return true;
   }
   logVerbose(`bond account를 확인했습니다. account: ${fmtAccount(bondAccount)}`);
 
@@ -1024,7 +1075,7 @@ async function runOnce() {
   if (!onchain) {
     log('❌ on-chain bond 상태를 읽지 못해 bid를 변경하지 않습니다.');
     await notifyDiscord('❌ `bid-bot`: on-chain bond 상태 조회에 실패해 이번 회차를 중단했습니다.');
-    return;
+    return true;
   }
   logVerbose(`현재 on-chain bid는 ${fmtPmpe(onchain.bid)}입니다.`);
 
@@ -1042,7 +1093,7 @@ async function runOnce() {
       log(`⚠️ bid-too-low 페널티가 발생 중입니다. 현재 페널티: ${fmtPenalty(status.bidTooLowPenalty)}`);
       await notifyDiscord(`⚠️ \`bid-bot\`: bid-too-low 페널티가 발생 중입니다. 현재 페널티: ${fmtPenalty(status.bidTooLowPenalty)}. 수동 점검이 필요합니다.`);
     }
-    return;
+    return true;
   }
 
   const dropCap = capSingleDrop(onchain.bid, target, status.effPart);
@@ -1052,7 +1103,7 @@ async function runOnce() {
     if (dropCap.blocked) {
       log('❌ 인하폭 제한을 적용해도 참여 bid보다 낮아져서 변경하지 않습니다.');
       await notifyDiscord(`⚠️ \`bid-bot\`: 큰 폭 인하가 필요하지만 안전 기준에 걸려 자동 변경을 멈췄습니다. 현재 ${fmtPmpe(onchain.bid)}, 목표 ${fmtPmpe(target)}.`);
-      return;
+      return true;
     }
   }
 
@@ -1070,7 +1121,7 @@ async function runOnce() {
   }
   log(`bid 변경이 필요합니다. ${fmtPmpe(onchain.bid)}에서 ${fmtPmpe(target)}로 조정합니다.`);
   if (applyBid(bondAccount, target, onchain.bid)) {
-    if (dryRunActive) return;
+    if (dryRunActive) return true;
     await notifyDiscord(`✅ \`bid-bot\`: on-chain bid를 ${fmtPmpe(onchain.bid)}에서 ${fmtPmpe(target)}로 변경했습니다. epoch ${status.epoch}, 참여 bid ${fmtPmpe(status.effPart)}.`);
     writeFileSync(STATE_FILE, JSON.stringify({
       last_bid: target, last_change_at: new Date().toISOString(), epoch: status.epoch,
@@ -1078,6 +1129,7 @@ async function runOnce() {
   } else {
     await notifyDiscord('❌ `bid-bot`: on-chain bid 변경에 실패했습니다.');
   }
+  return true;
 }
 
 export {
@@ -1091,6 +1143,7 @@ export {
   extractMyEffBidsFromAuctions,
   extractMyStatusFromResults,
   findValidatorNameByVoteAccount,
+  formatDiscordCodeBlockMessages,
   formatDiscordContent,
   formatBidCalculationTable,
   formatFillRankTable,
@@ -1100,7 +1153,10 @@ export {
   patchDsSamSdkForPrereleaseVersions,
   pmpeToCpmpeLamports,
   refreshHeavyFiles,
+  hasFillRankTableChanged,
+  resolveMode,
   shouldChangeBid,
+  shouldCheckScheduledFillRankReport,
 };
 
 // ============================================================
@@ -1140,18 +1196,46 @@ async function main() {
     if (EPOCH_AWARE_LOOP) {
       log(`epoch-aware loop가 켜져 있습니다. Solana epoch 종료가 ${fmtDuration(EPOCH_FAST_THRESHOLD_SECONDS)} 이내로 다가오면 최대 ${fmtDuration(EPOCH_FAST_INTERVAL / 1000)}마다 확인합니다.`);
     }
+    if (loopFillRankReports) {
+      log(`fill-rank Discord 알림이 켜져 있습니다. 첫 회차 계산 후 1회 전송하고, 이후 ${fmtDuration(FILL_RANK_DISCORD_CHECK_INTERVAL_MS / 1000)}마다 표 변경 여부를 확인합니다.`);
+      if (!DISCORD_WEBHOOK) {
+        log('⚠️ discordWebhook이 비어 있어 fill-rank 표를 Discord로 보낼 수 없습니다.');
+      }
+    }
     let firstLoopRun = true;
+    let lastFillRankCheckAt = null;
+    let lastFillRankTable = null;
     while (true) {
       if (firstLoopRun) {
         log('첫 회차 확인을 바로 시작합니다. 매 회차 계산표를 표시합니다.');
       }
-      try { await runOnce(); } catch (e) { log(`예상하지 못한 오류가 발생했습니다. 다음 회차에서 다시 시도합니다. ${e.stack || e.message}`); }
+      let freshResults = false;
+      try { freshResults = await runOnce(); } catch (e) { log(`예상하지 못한 오류가 발생했습니다. 다음 회차에서 다시 시도합니다. ${e.stack || e.message}`); }
+      const now = Date.now();
+      if (loopFillRankReports && freshResults && shouldCheckScheduledFillRankReport(now, lastFillRankCheckAt)) {
+        try {
+          const table = readFillRankTable(FILL_RANK_LIMIT);
+          const changed = hasFillRankTableChanged(table, lastFillRankTable);
+          lastFillRankCheckAt = now;
+          if (changed) {
+            const reason = lastFillRankTable == null ? '시작 알림' : '변경 감지';
+            lastFillRankTable = table;
+            if (DISCORD_WEBHOOK) {
+              await notifyFillRankReportToDiscord(reason, table);
+              log(`fill-rank 표 변경을 감지해 Discord로 보냈습니다. 다음 변경 확인은 ${fmtDuration(FILL_RANK_DISCORD_CHECK_INTERVAL_MS / 1000)} 후입니다.`);
+            }
+          }
+        } catch (e) {
+          log(`fill-rank Discord 알림 생성에 실패했습니다. 이유: ${e.stack || e.message}`);
+        }
+      }
       const delayMs = await nextLoopDelayMs();
+      const loopDelayMs = loopFillRankReports ? Math.min(delayMs, FILL_RANK_DISCORD_CHECK_INTERVAL_MS) : delayMs;
       if (firstLoopRun) {
-        log(`첫 회차 확인이 끝났습니다. 다음 확인은 ${fmtDuration(delayMs / 1000)} 후입니다.`);
+        log(`첫 회차 확인이 끝났습니다. 다음 확인은 ${fmtDuration(loopDelayMs / 1000)} 후입니다.`);
         firstLoopRun = false;
       }
-      await new Promise(r => setTimeout(r, delayMs));
+      await new Promise(r => setTimeout(r, loopDelayMs));
     }
   } else {
     try { await runOnce(); } catch (e) { log(`예상하지 못한 오류가 발생해 종료합니다. ${e.stack || e.message}`); process.exit(1); }
