@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   buildConfigureBondArgs,
@@ -28,6 +31,7 @@ import {
   resolveManualBidFloor,
   shouldChangeBid,
   shouldCheckScheduledFillRankReport,
+  shouldRefreshHeavyInputs,
 } from '../bid-bot.js';
 
 test('computeTargetBid keeps the highest safety floor and rounds to 4 decimals', () => {
@@ -453,6 +457,51 @@ test('Discord fill-rank messages wrap fixed-width tables in code blocks', () => 
   assert.match(message, /Priority/);
   assert.match(message, /   1  A11pGb\.\.\.KtS5        14  19,335/);
   assert.match(message, /\n```$/);
+});
+
+test('heavy inputs refresh when live bonds epoch differs from last ds-sam result epoch', () => {
+  const root = mkdtempSync(join(tmpdir(), 'bid-bot-cache-'));
+  const cacheDir = join(root, 'cache');
+  const outputDir = join(root, 'output');
+  mkdirSync(cacheDir);
+  mkdirSync(outputDir);
+  writeFileSync(join(cacheDir, 'bonds.json'), JSON.stringify({ bonds: [{ epoch: 982 }] }));
+  writeFileSync(join(outputDir, 'results.json'), JSON.stringify({ auctionData: { epoch: 981 } }));
+
+  const status = shouldRefreshHeavyInputs({
+    cacheDir,
+    outputDir,
+    files: [],
+    ttl: 24 * 60 * 60,
+  });
+
+  assert.equal(status.refresh, true);
+  assert.equal(status.epochChanged, true);
+  assert.equal(status.bondsEpoch, 982);
+  assert.equal(status.resultsEpoch, 981);
+  assert.deepEqual(status.reasons, ['epoch 981 -> 982']);
+});
+
+test('heavy inputs stay cached when live bonds epoch matches last ds-sam result epoch', () => {
+  const root = mkdtempSync(join(tmpdir(), 'bid-bot-cache-'));
+  const cacheDir = join(root, 'cache');
+  const outputDir = join(root, 'output');
+  mkdirSync(cacheDir);
+  mkdirSync(outputDir);
+  writeFileSync(join(cacheDir, 'bonds.json'), JSON.stringify({ bonds: [{ epoch: 982 }] }));
+  writeFileSync(join(outputDir, 'results.json'), JSON.stringify({ auctionData: { epoch: 982 } }));
+
+  const status = shouldRefreshHeavyInputs({
+    cacheDir,
+    outputDir,
+    files: [],
+    ttl: 24 * 60 * 60,
+  });
+
+  assert.equal(status.refresh, false);
+  assert.equal(status.epochChanged, false);
+  assert.equal(status.bondsEpoch, 982);
+  assert.equal(status.resultsEpoch, 982);
 });
 
 test('refreshHeavyFiles reports failed heavy inputs before calculation can continue', async () => {

@@ -500,6 +500,50 @@ function freshWithin(file, seconds) {
   if (!existsSync(file)) return false;
   return (Date.now() - statSync(file).mtimeMs) / 1000 <= seconds;
 }
+function readJsonFile(file) {
+  if (!existsSync(file)) return null;
+  try { return JSON.parse(readFileSync(file, 'utf8')); }
+  catch { return null; }
+}
+function extractBondsEpoch(data) {
+  const bonds = Array.isArray(data) ? data : data?.bonds;
+  if (!Array.isArray(bonds)) return null;
+  const epochs = bonds.map(row => Number(row?.epoch)).filter(Number.isFinite);
+  return epochs.length > 0 ? Math.max(...epochs) : null;
+}
+function readCachedBondsEpoch(cacheDir = CACHE_DIR) {
+  return extractBondsEpoch(readJsonFile(`${cacheDir}/bonds.json`));
+}
+function readCachedResultsEpoch(outputDir = OUTPUT_DIR) {
+  const epoch = readJsonFile(`${outputDir}/results.json`)?.auctionData?.epoch;
+  return Number.isFinite(epoch) ? epoch : null;
+}
+function shouldRefreshHeavyInputs(opts = {}) {
+  const force = opts.force ?? false;
+  const cacheDir = opts.cacheDir ?? CACHE_DIR;
+  const outputDir = opts.outputDir ?? OUTPUT_DIR;
+  const ttl = opts.ttl ?? HEAVY_CACHE_TTL;
+  const files = opts.files ?? HEAVY_FILES;
+  const ttlExpired = files.some(([f]) => !freshWithin(`${cacheDir}/${f}`, ttl));
+  const bondsEpoch = readCachedBondsEpoch(cacheDir);
+  const resultsEpoch = readCachedResultsEpoch(outputDir);
+  const epochChanged = bondsEpoch != null && resultsEpoch !== bondsEpoch;
+  const reasons = [
+    force ? '--force-refresh' : null,
+    ttlExpired ? 'cache ttl/missing file' : null,
+    epochChanged ? `epoch ${resultsEpoch ?? 'none'} -> ${bondsEpoch}` : null,
+  ].filter(Boolean);
+
+  return {
+    refresh: reasons.length > 0,
+    reasons,
+    force,
+    ttlExpired,
+    epochChanged,
+    bondsEpoch,
+    resultsEpoch,
+  };
+}
 async function downloadFile(url, dest, timeoutMs = 120000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -710,10 +754,14 @@ async function fetchLiveBonds() {
 }
 
 async function fetchHeavyIfStale(force = false) {
-  const need = force || HEAVY_FILES.some(([f]) => !freshWithin(`${CACHE_DIR}/${f}`, HEAVY_CACHE_TTL));
-  if (!need) { logVerbose('검증용 보조 데이터 cache가 아직 유효해서 다시 받지 않습니다.'); return true; }
+  const refreshStatus = shouldRefreshHeavyInputs({ force });
+  if (!refreshStatus.refresh) { logVerbose('검증용 보조 데이터 cache가 아직 유효해서 다시 받지 않습니다.'); return true; }
 
-  logVerbose('검증용 보조 데이터를 새로 받습니다. 보통 30~60초 걸립니다.');
+  if (refreshStatus.epochChanged) {
+    log(`live bonds epoch(${refreshStatus.bondsEpoch})과 마지막 계산 epoch(${refreshStatus.resultsEpoch ?? '없음'})이 달라 보조 데이터를 새로 받습니다.`);
+  } else {
+    logVerbose(`검증용 보조 데이터를 새로 받습니다. 이유: ${refreshStatus.reasons.join(', ') || 'unknown'}. 보통 30~60초 걸립니다.`);
+  }
   const failedFiles = await refreshHeavyFiles(HEAVY_FILES, CACHE_DIR);
   if (failedFiles.length > 0) {
     log(`검증용 보조 데이터 갱신에 실패했습니다. 실패 파일: ${failedFiles.join(', ')}. 오래된 cache로 계산하지 않기 위해 이번 회차를 중단합니다.`);
@@ -1355,6 +1403,7 @@ export {
   resolveMode,
   shouldChangeBid,
   shouldCheckScheduledFillRankReport,
+  shouldRefreshHeavyInputs,
 };
 
 // ============================================================
