@@ -108,6 +108,9 @@ const EPOCH_RPC_TIMEOUT_MS = +get('EPOCH_RPC_TIMEOUT_MS', 'runtime.epochAware.rp
 const VALIDATOR_NAME_LOOKUP_URL = 'https://validators-api.marinade.finance/validators?epochs=1&limit=1000000';
 const VALIDATOR_NAME_TIMEOUT_MS = +get('VALIDATOR_NAME_TIMEOUT_MS', 'runtime.validatorNameTimeoutMs', 10000);
 const FILL_RANK_DISCORD_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+const FILL_RANK_MIN_STAKE_DELTA_SOL = +get('FILL_RANK_MIN_STAKE_DELTA_SOL', 'runtime.fillRankChange.minStakeDeltaSol', 1000);
+const FILL_RANK_MIN_BID_DELTA_PMPE = +get('FILL_RANK_MIN_BID_DELTA_PMPE', 'runtime.fillRankChange.minBidDeltaPmpe', 0.0005);
+const FILL_RANK_MIN_FILL_PCT_DELTA = +get('FILL_RANK_MIN_FILL_PCT_DELTA', 'runtime.fillRankChange.minFillPctDelta', 0.01);
 
 function resolveMode(argv) {
   if (argv.includes('--setup')) return 'setup';
@@ -1037,6 +1040,47 @@ function hasFillRankTableChanged(currentTable, lastSentTable) {
   return lastSentTable == null || currentTable !== lastSentTable;
 }
 
+function numberDeltaChanged(current, previous, threshold) {
+  const a = Number(current);
+  const b = Number(previous);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return a !== b;
+  return Math.abs(a - b) + Number.EPSILON >= threshold;
+}
+
+function hasMaterialFillRankChange(currentResult, lastSentResult, opts = {}) {
+  if (lastSentResult == null) return true;
+
+  const minStakeDeltaSol = opts.minStakeDeltaSol ?? FILL_RANK_MIN_STAKE_DELTA_SOL;
+  const minBidDeltaPmpe = opts.minBidDeltaPmpe ?? FILL_RANK_MIN_BID_DELTA_PMPE;
+  const minFillPctDelta = opts.minFillPctDelta ?? FILL_RANK_MIN_FILL_PCT_DELTA;
+  const currentRows = currentResult?.rows ?? [];
+  const previousRows = lastSentResult?.rows ?? [];
+
+  if (currentResult?.epoch !== lastSentResult?.epoch) return true;
+  if (currentResult?.receiverCount !== lastSentResult?.receiverCount) return true;
+  if (currentRows.length !== previousRows.length) return true;
+  if (numberDeltaChanged(currentResult?.redelegateBudget, lastSentResult?.redelegateBudget, minStakeDeltaSol)) return true;
+
+  for (let i = 0; i < currentRows.length; i += 1) {
+    const current = currentRows[i];
+    const previous = previousRows[i];
+    if (!previous) return true;
+    if (current.rank !== previous.rank) return true;
+    if (current.voteAccount !== previous.voteAccount) return true;
+    if (current.stakePriority !== previous.stakePriority) return true;
+
+    for (const field of ['target', 'active', 'need', 'fill']) {
+      if (numberDeltaChanged(current[field], previous[field], minStakeDeltaSol)) return true;
+    }
+    for (const field of ['bidPmpe', 'normalizedBidPmpe']) {
+      if (numberDeltaChanged(current[field], previous[field], minBidDeltaPmpe)) return true;
+    }
+    if (numberDeltaChanged(current.fillPct, previous.fillPct, minFillPctDelta)) return true;
+  }
+
+  return false;
+}
+
 async function notifyFillRankReportToDiscord(reason, table = readFillRankTable(FILL_RANK_LIMIT), result = readFillRankResult(FILL_RANK_LIMIT)) {
   const title = `📊 \`bid-bot\`: fill-rank --rank-limit ${FILL_RANK_LIMIT}${reason ? ` (${reason})` : ''}`;
   const filename = `bid-bot-fill-rank-epoch-${result.epoch ?? 'unknown'}-top-${FILL_RANK_LIMIT}.png`;
@@ -1399,6 +1443,7 @@ export {
   refreshHeavyFiles,
   renderFillRankImagePng,
   hasFillRankTableChanged,
+  hasMaterialFillRankChange,
   resolveManualBidFloor,
   resolveMode,
   shouldChangeBid,
@@ -1451,7 +1496,7 @@ async function main() {
     }
     let firstLoopRun = true;
     let lastFillRankCheckAt = null;
-    let lastFillRankTable = null;
+    let lastFillRankResult = null;
     while (true) {
       if (firstLoopRun) {
         log('첫 회차 확인을 바로 시작합니다. 매 회차 계산표를 표시합니다.');
@@ -1461,15 +1506,16 @@ async function main() {
       const now = Date.now();
       if (loopFillRankReports && freshResults && shouldCheckScheduledFillRankReport(now, lastFillRankCheckAt)) {
         try {
-          const table = readFillRankTable(FILL_RANK_LIMIT);
-          const changed = hasFillRankTableChanged(table, lastFillRankTable);
+          const result = readFillRankResult(FILL_RANK_LIMIT);
+          const table = formatFillRankTable(result);
+          const changed = hasMaterialFillRankChange(result, lastFillRankResult);
           lastFillRankCheckAt = now;
           if (changed) {
-            const reason = lastFillRankTable == null ? '시작 알림' : '변경 감지';
-            lastFillRankTable = table;
+            const reason = lastFillRankResult == null ? '시작 알림' : '변경 감지';
+            lastFillRankResult = result;
             if (DISCORD_WEBHOOK) {
-              await notifyFillRankReportToDiscord(reason, table);
-              log(`fill-rank 표 변경을 감지해 Discord 이미지로 보냈습니다. 다음 변경 확인은 ${fmtDuration(FILL_RANK_DISCORD_CHECK_INTERVAL_MS / 1000)} 후입니다.`);
+              await notifyFillRankReportToDiscord(reason, table, result);
+              log(`fill-rank의 의미 있는 변화를 감지해 Discord 이미지로 보냈습니다. 다음 변경 확인은 ${fmtDuration(FILL_RANK_DISCORD_CHECK_INTERVAL_MS / 1000)} 후입니다.`);
             }
           }
         } catch (e) {

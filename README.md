@@ -128,7 +128,7 @@ node bid-bot.js --fill-rank --rank-limit 9
 
 live bonds API를 반영해 ds-sam을 다시 계산한 뒤, `stakePriority` 오름차순으로 정렬하고 `SAM Target - SAM Active > 0`인 validator만 보여줍니다. `Fill 예상`은 대시보드의 `Stake To Distribute`와 같은 기준인 `SAM TVL - Active 합계` budget으로 계산합니다. `Bid @5/0`은 모든 validator를 commission 5%, tip/MEV commission 0% 기준으로 맞췄을 때의 환산 bid입니다.
 
-`--loop --fill-rank --rank-limit 9`로 실행하면 일반 bid loop를 유지하면서 첫 회차 계산 후 한 번 fill-rank 표를 Discord로 보냅니다. 이후에는 매시간 표를 다시 계산하고, 이전에 보낸 표와 달라진 경우에만 다시 보냅니다. Discord에는 모바일에서도 표가 깨지지 않도록 PNG 이미지 attachment로 전송합니다. 이미지 생성이나 업로드가 실패하면 기존 `text` code block 표로 fallback합니다. `logging.discordWebhook`이 비어 있으면 표를 보낼 수 없습니다.
+`--loop --fill-rank --rank-limit 9`로 실행하면 일반 bid loop를 유지하면서 첫 회차 계산 후 한 번 fill-rank 표를 Discord로 보냅니다. 이후에는 매시간 표를 다시 계산하고, 의미 있는 변화가 있을 때만 다시 보냅니다. 기본값은 SOL 계열 값 1,000 SOL 이상, bid 0.0005 PMPE 이상, fill 비율 1%p 이상 변화입니다. rank/order/epoch/receiver count 변화는 항상 알림 대상입니다. Discord에는 모바일에서도 표가 깨지지 않도록 PNG 이미지 attachment로 전송합니다. 이미지 생성이나 업로드가 실패하면 기존 `text` code block 표로 fallback합니다. `logging.discordWebhook`이 비어 있으면 표를 보낼 수 없습니다.
 
 예시:
 
@@ -324,6 +324,19 @@ BID_BOT_CONFIG=/path/to/my-bid-bot.json node bid-bot.js --dry-run
       // Solana RPC가 이 시간 안에 응답하지 않으면 기본 주기로 fallback.
       // 밀리초 단위. 10000 = 10초.
       "rpcTimeoutMs": 10000
+    },
+
+    "fillRankChange": {
+      // Discord fill-rank 알림에서 이보다 작은 SOL 변화는 무시.
+      // Re-delegate budget, Target, Active, 받을 Stake, Fill 예상에 적용.
+      "minStakeDeltaSol": 1000,
+
+      // Bid / Bid @5/0 변화가 이보다 작으면 무시.
+      "minBidDeltaPmpe": 0.0005,
+
+      // Fill 비율 변화가 이보다 작으면 무시.
+      // 0.01 = 1%p.
+      "minFillPctDelta": 0.01
     },
 
     // Marinade SAM 계산이 이 시간 안에 끝나지 않으면 중단.

@@ -48,6 +48,12 @@
       "solanaRpcUrl": "https://api.mainnet-beta.solana.com",
       "rpcTimeoutMs": 10000
     },
+    "fillRankChange": {
+      "_comment": "Discord fill-rank 알림은 작은 숫자 변화는 무시하고, 아래 기준 이상일 때만 다시 보냅니다.",
+      "minStakeDeltaSol": 1000,
+      "minBidDeltaPmpe": 0.0005,
+      "minFillPctDelta": 0.01
+    },
     "dsSamTimeoutMs": 300000,
     "bondCliTimeoutMs": 60000,
     "setupCommandTimeoutMs": 900000

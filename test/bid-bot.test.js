@@ -20,6 +20,7 @@ import {
   formatFillRankTable,
   fmtDuration,
   hasFillRankTableChanged,
+  hasMaterialFillRankChange,
   isTargetInSanityRange,
   parseCpmpeBid,
   patchDsSamSdkForPrereleaseVersions,
@@ -440,6 +441,76 @@ test('fill-rank Discord report sends only when the table changes', () => {
   assert.equal(hasFillRankTableChanged(table, null), true);
   assert.equal(hasFillRankTableChanged(table, table), false);
   assert.equal(hasFillRankTableChanged(`${table}\n   2  HHLMTH...ubgq`, table), true);
+});
+
+function sampleFillRankResult() {
+  return {
+    epoch: 982,
+    redelegateBudget: 128_000,
+    receiverCount: 2,
+    rows: [
+      {
+        rank: 1,
+        voteAccount: 'rank-one',
+        stakePriority: 10,
+        target: 120_000,
+        active: 110_000,
+        need: 10_000,
+        fill: 10_000,
+        fillPct: 1,
+        bidPmpe: 0.1510,
+        normalizedBidPmpe: 0.1664,
+      },
+      {
+        rank: 2,
+        voteAccount: 'rank-two',
+        stakePriority: 20,
+        target: 90_000,
+        active: 80_000,
+        need: 10_000,
+        fill: 5_000,
+        fillPct: 0.5,
+        bidPmpe: 0.1151,
+        normalizedBidPmpe: 0.1151,
+      },
+    ],
+  };
+}
+
+test('material fill-rank change ignores small numeric drift', () => {
+  const last = sampleFillRankResult();
+  const current = JSON.parse(JSON.stringify(last));
+  current.redelegateBudget += 999;
+  current.rows[0].target += 999;
+  current.rows[0].fillPct -= 0.009;
+  current.rows[1].bidPmpe += 0.0004;
+
+  assert.equal(hasMaterialFillRankChange(current, last, {
+    minStakeDeltaSol: 1000,
+    minBidDeltaPmpe: 0.0005,
+    minFillPctDelta: 0.01,
+  }), false);
+});
+
+test('material fill-rank change detects rank and threshold changes', () => {
+  const last = sampleFillRankResult();
+  assert.equal(hasMaterialFillRankChange(last, null), true);
+
+  const stakeChanged = JSON.parse(JSON.stringify(last));
+  stakeChanged.redelegateBudget += 1000;
+  assert.equal(hasMaterialFillRankChange(stakeChanged, last, {
+    minStakeDeltaSol: 1000,
+    minBidDeltaPmpe: 0.0005,
+    minFillPctDelta: 0.01,
+  }), true);
+
+  const rankChanged = JSON.parse(JSON.stringify(last));
+  rankChanged.rows.reverse();
+  assert.equal(hasMaterialFillRankChange(rankChanged, last, {
+    minStakeDeltaSol: 1000,
+    minBidDeltaPmpe: 0.0005,
+    minFillPctDelta: 0.01,
+  }), true);
 });
 
 test('Discord fill-rank messages wrap fixed-width tables in code blocks', () => {
