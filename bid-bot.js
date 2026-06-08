@@ -168,6 +168,11 @@ function fmtPct0(n) {
     ? `${(n * 100).toLocaleString('en-US', { maximumFractionDigits: 0 })}%`
     : String(n);
 }
+function fmtPctPoint0(n) {
+  return Number.isFinite(n)
+    ? `${(n * 100).toLocaleString('en-US', { maximumFractionDigits: 0 })}%p`
+    : String(n);
+}
 function calcPmpeAfterCommission(pmpe, commissionDec) {
   if (!Number.isFinite(pmpe) || pmpe <= 0) return 0;
   if (!Number.isFinite(commissionDec) || commissionDec >= 1) return 0;
@@ -1047,57 +1052,148 @@ function numberDeltaChanged(current, previous, threshold) {
   return Math.abs(a - b) + Number.EPSILON >= threshold;
 }
 
-function hasMaterialFillRankChange(currentResult, lastSentResult, opts = {}) {
-  if (lastSentResult == null) return true;
+function formatSignedDelta(delta, formatter, suffix = '') {
+  if (!Number.isFinite(delta)) return String(delta);
+  const sign = delta >= 0 ? '+' : '-';
+  return `${sign}${formatter(Math.abs(delta))}${suffix}`;
+}
+
+function thresholdChangeReason(configKey, label, currentValue, previousValue, threshold, formatDelta, formatThreshold) {
+  if (!numberDeltaChanged(currentValue, previousValue, threshold)) return null;
+  const current = Number(currentValue);
+  const previous = Number(previousValue);
+  if (!Number.isFinite(current) || !Number.isFinite(previous)) {
+    return `${configKey} 비교값 변경: ${label} ${previousValue ?? 'none'} -> ${currentValue ?? 'none'}`;
+  }
+  return `${configKey} 이상: ${label} ${formatDelta(current - previous)} (기준 ${formatThreshold(threshold)})`;
+}
+
+function describeMaterialFillRankChanges(currentResult, lastSentResult, opts = {}) {
+  if (lastSentResult == null) return ['시작 알림: 이전 fill-rank 기준 없음'];
 
   const minStakeDeltaSol = opts.minStakeDeltaSol ?? FILL_RANK_MIN_STAKE_DELTA_SOL;
   const minBidDeltaPmpe = opts.minBidDeltaPmpe ?? FILL_RANK_MIN_BID_DELTA_PMPE;
   const minFillPctDelta = opts.minFillPctDelta ?? FILL_RANK_MIN_FILL_PCT_DELTA;
   const currentRows = currentResult?.rows ?? [];
   const previousRows = lastSentResult?.rows ?? [];
+  const reasons = [];
+  const addReason = (reason) => {
+    if (reason) reasons.push(reason);
+  };
+  const signedSol = delta => `${formatSignedDelta(delta, fmtSol0)} SOL`;
+  const signedPmpe = delta => `${formatSignedDelta(delta, fmt4)} PMPE`;
+  const signedPctPoint = delta => formatSignedDelta(delta, fmtPctPoint0);
 
-  if (currentResult?.epoch !== lastSentResult?.epoch) return true;
-  if (currentResult?.receiverCount !== lastSentResult?.receiverCount) return true;
-  if (currentRows.length !== previousRows.length) return true;
-  if (numberDeltaChanged(currentResult?.redelegateBudget, lastSentResult?.redelegateBudget, minStakeDeltaSol)) return true;
+  if (currentResult?.epoch !== lastSentResult?.epoch) {
+    reasons.push(`고정 알림 조건: Epoch ${lastSentResult?.epoch ?? 'none'} -> ${currentResult?.epoch ?? 'none'}`);
+  }
+  if (currentResult?.receiverCount !== lastSentResult?.receiverCount) {
+    reasons.push(`고정 알림 조건: Receivers ${lastSentResult?.receiverCount ?? 'none'} -> ${currentResult?.receiverCount ?? 'none'}`);
+  }
+  if (currentRows.length !== previousRows.length) {
+    reasons.push(`고정 알림 조건: Table rows ${previousRows.length} -> ${currentRows.length}`);
+  }
+  addReason(thresholdChangeReason(
+    'minStakeDeltaSol',
+    'Re-delegate budget',
+    currentResult?.redelegateBudget,
+    lastSentResult?.redelegateBudget,
+    minStakeDeltaSol,
+    signedSol,
+    threshold => `${fmtSol0(threshold)} SOL`,
+  ));
 
   for (let i = 0; i < currentRows.length; i += 1) {
     const current = currentRows[i];
     const previous = previousRows[i];
-    if (!previous) return true;
-    if (current.rank !== previous.rank) return true;
-    if (current.voteAccount !== previous.voteAccount) return true;
-    if (current.stakePriority !== previous.stakePriority) return true;
+    if (!previous) {
+      reasons.push(`고정 알림 조건: 새 row 추가 Rank ${current?.rank ?? i + 1} ${fmtAccount(current?.voteAccount)}`);
+      continue;
+    }
+    if (current.rank !== previous.rank || current.voteAccount !== previous.voteAccount) {
+      reasons.push(`고정 알림 조건: 순위/order 변경 #${i + 1} ${fmtAccount(previous.voteAccount)} -> ${fmtAccount(current.voteAccount)}`);
+      continue;
+    }
+    const rowLabel = `Rank ${current.rank} ${fmtAccount(current.voteAccount)}`;
+    if (current.stakePriority !== previous.stakePriority) {
+      reasons.push(`고정 알림 조건: ${rowLabel} Stake Priority ${previous.stakePriority ?? 'none'} -> ${current.stakePriority ?? 'none'}`);
+    }
 
-    for (const field of ['target', 'active', 'need', 'fill']) {
-      if (numberDeltaChanged(current[field], previous[field], minStakeDeltaSol)) return true;
+    for (const [field, label] of [
+      ['target', 'Target'],
+      ['active', 'Active'],
+      ['need', '받을 Stake'],
+      ['fill', 'Fill 예상'],
+    ]) {
+      addReason(thresholdChangeReason(
+        'minStakeDeltaSol',
+        `${rowLabel} ${label}`,
+        current[field],
+        previous[field],
+        minStakeDeltaSol,
+        signedSol,
+        threshold => `${fmtSol0(threshold)} SOL`,
+      ));
     }
-    for (const field of ['bidPmpe', 'normalizedBidPmpe']) {
-      if (numberDeltaChanged(current[field], previous[field], minBidDeltaPmpe)) return true;
+    for (const [field, label] of [
+      ['bidPmpe', 'Bid'],
+      ['normalizedBidPmpe', 'Bid @5/0'],
+    ]) {
+      addReason(thresholdChangeReason(
+        'minBidDeltaPmpe',
+        `${rowLabel} ${label}`,
+        current[field],
+        previous[field],
+        minBidDeltaPmpe,
+        signedPmpe,
+        threshold => `${fmt4(threshold)} PMPE`,
+      ));
     }
-    if (numberDeltaChanged(current.fillPct, previous.fillPct, minFillPctDelta)) return true;
+    addReason(thresholdChangeReason(
+      'minFillPctDelta',
+      `${rowLabel} Fill`,
+      current.fillPct,
+      previous.fillPct,
+      minFillPctDelta,
+      signedPctPoint,
+      fmtPctPoint0,
+    ));
   }
 
-  return false;
+  return reasons;
 }
 
-async function notifyFillRankReportToDiscord(reason, table = readFillRankTable(FILL_RANK_LIMIT), result = readFillRankResult(FILL_RANK_LIMIT)) {
+function hasMaterialFillRankChange(currentResult, lastSentResult, opts = {}) {
+  return describeMaterialFillRankChanges(currentResult, lastSentResult, opts).length > 0;
+}
+
+function formatFillRankChangeReasons(reasons, opts = {}) {
+  if (!Array.isArray(reasons) || reasons.length === 0) return '의미 있는 변화 없음';
+  const maxReasons = opts.maxReasons ?? 5;
+  const shown = reasons.slice(0, maxReasons);
+  const remaining = reasons.length - shown.length;
+  return `${shown.join('; ')}${remaining > 0 ? `; 외 ${remaining}건` : ''}`;
+}
+
+async function notifyFillRankReportToDiscord(reason, table = readFillRankTable(FILL_RANK_LIMIT), result = readFillRankResult(FILL_RANK_LIMIT), changeReasons = []) {
   const title = `📊 \`bid-bot\`: fill-rank --rank-limit ${FILL_RANK_LIMIT}${reason ? ` (${reason})` : ''}`;
   const filename = `bid-bot-fill-rank-epoch-${result.epoch ?? 'unknown'}-top-${FILL_RANK_LIMIT}.png`;
   const reasonLabel = reason === '시작 알림' ? 'start' : reason === '변경 감지' ? 'changed' : reason;
+  const changeSummary = formatFillRankChangeReasons(changeReasons);
+  const message = `${title}\n이유: ${changeSummary}`;
   try {
     const imageBuffer = await renderFillRankImagePng(result, {
       title: `fill-rank --rank-limit ${FILL_RANK_LIMIT}`,
       reason: reasonLabel,
     });
-    if (await notifyDiscordImage(title, filename, imageBuffer)) {
+    if (await notifyDiscordImage(message, filename, imageBuffer)) {
       return;
     }
   } catch (e) {
     log(`fill-rank 이미지를 만들지 못해 text table로 fallback합니다. 이유: ${e.message}`);
   }
-  for (const message of formatDiscordCodeBlockMessages(`${title} (image upload failed)`, table)) {
-    await notifyDiscord(message);
+  for (const fallbackMessage of formatDiscordCodeBlockMessages(`${message} (image upload failed)`, table)) {
+    await notifyDiscord(fallbackMessage);
   }
 }
 
@@ -1432,6 +1528,7 @@ export {
   formatDiscordCodeBlockMessages,
   formatDiscordContent,
   formatBidCalculationTable,
+  formatFillRankChangeReasons,
   formatFillRankImageSvg,
   formatFillRankTable,
   fmtDuration,
@@ -1444,6 +1541,7 @@ export {
   renderFillRankImagePng,
   hasFillRankTableChanged,
   hasMaterialFillRankChange,
+  describeMaterialFillRankChanges,
   resolveManualBidFloor,
   resolveMode,
   shouldChangeBid,
@@ -1508,14 +1606,15 @@ async function main() {
         try {
           const result = readFillRankResult(FILL_RANK_LIMIT);
           const table = formatFillRankTable(result);
-          const changed = hasMaterialFillRankChange(result, lastFillRankResult);
+          const changeReasons = describeMaterialFillRankChanges(result, lastFillRankResult);
+          const changed = changeReasons.length > 0;
           lastFillRankCheckAt = now;
           if (changed) {
             const reason = lastFillRankResult == null ? '시작 알림' : '변경 감지';
             lastFillRankResult = result;
             if (DISCORD_WEBHOOK) {
-              await notifyFillRankReportToDiscord(reason, table, result);
-              log(`fill-rank의 의미 있는 변화를 감지해 Discord 이미지로 보냈습니다. 다음 변경 확인은 ${fmtDuration(FILL_RANK_DISCORD_CHECK_INTERVAL_MS / 1000)} 후입니다.`);
+              await notifyFillRankReportToDiscord(reason, table, result, changeReasons);
+              log(`fill-rank 변화를 감지해 Discord 이미지로 보냈습니다. 이유: ${formatFillRankChangeReasons(changeReasons)}. 다음 변경 확인은 ${fmtDuration(FILL_RANK_DISCORD_CHECK_INTERVAL_MS / 1000)} 후입니다.`);
             }
           }
         } catch (e) {

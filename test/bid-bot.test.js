@@ -11,11 +11,13 @@ import {
   chooseLoopDelayMs,
   computeFillRankRowsFromResults,
   computeTargetBid,
+  describeMaterialFillRankChanges,
   extractMyStatusFromResults,
   findValidatorNameByVoteAccount,
   formatDiscordCodeBlockMessages,
   formatDiscordContent,
   formatBidCalculationTable,
+  formatFillRankChangeReasons,
   formatFillRankImageSvg,
   formatFillRankTable,
   fmtDuration,
@@ -490,11 +492,17 @@ test('material fill-rank change ignores small numeric drift', () => {
     minBidDeltaPmpe: 0.0005,
     minFillPctDelta: 0.01,
   }), false);
+  assert.deepEqual(describeMaterialFillRankChanges(current, last, {
+    minStakeDeltaSol: 1000,
+    minBidDeltaPmpe: 0.0005,
+    minFillPctDelta: 0.01,
+  }), []);
 });
 
 test('material fill-rank change detects rank and threshold changes', () => {
   const last = sampleFillRankResult();
   assert.equal(hasMaterialFillRankChange(last, null), true);
+  assert.deepEqual(describeMaterialFillRankChanges(last, null), ['시작 알림: 이전 fill-rank 기준 없음']);
 
   const stakeChanged = JSON.parse(JSON.stringify(last));
   stakeChanged.redelegateBudget += 1000;
@@ -503,6 +511,11 @@ test('material fill-rank change detects rank and threshold changes', () => {
     minBidDeltaPmpe: 0.0005,
     minFillPctDelta: 0.01,
   }), true);
+  assert.deepEqual(describeMaterialFillRankChanges(stakeChanged, last, {
+    minStakeDeltaSol: 1000,
+    minBidDeltaPmpe: 0.0005,
+    minFillPctDelta: 0.01,
+  }), ['minStakeDeltaSol 이상: Re-delegate budget +1,000 SOL (기준 1,000 SOL)']);
 
   const rankChanged = JSON.parse(JSON.stringify(last));
   rankChanged.rows.reverse();
@@ -511,6 +524,40 @@ test('material fill-rank change detects rank and threshold changes', () => {
     minBidDeltaPmpe: 0.0005,
     minFillPctDelta: 0.01,
   }), true);
+  assert.match(describeMaterialFillRankChanges(rankChanged, last, {
+    minStakeDeltaSol: 1000,
+    minBidDeltaPmpe: 0.0005,
+    minFillPctDelta: 0.01,
+  })[0], /고정 알림 조건: 순위\/order 변경 #1 rank-one -> rank-two/);
+});
+
+test('fill-rank change reasons name the exceeded delta threshold', () => {
+  const last = sampleFillRankResult();
+
+  const bidChanged = JSON.parse(JSON.stringify(last));
+  bidChanged.rows[1].bidPmpe += 0.0005;
+  const bidReasons = describeMaterialFillRankChanges(bidChanged, last, {
+    minStakeDeltaSol: 1000,
+    minBidDeltaPmpe: 0.0005,
+    minFillPctDelta: 0.01,
+  });
+  assert.deepEqual(bidReasons, ['minBidDeltaPmpe 이상: Rank 2 rank-two Bid +0.0005 PMPE (기준 0.0005 PMPE)']);
+
+  const fillPctChanged = JSON.parse(JSON.stringify(last));
+  fillPctChanged.rows[1].fillPct += 0.01;
+  const fillPctReasons = describeMaterialFillRankChanges(fillPctChanged, last, {
+    minStakeDeltaSol: 1000,
+    minBidDeltaPmpe: 0.0005,
+    minFillPctDelta: 0.01,
+  });
+  assert.deepEqual(fillPctReasons, ['minFillPctDelta 이상: Rank 2 rank-two Fill +1%p (기준 1%p)']);
+
+  const summarized = formatFillRankChangeReasons([
+    ...bidReasons,
+    ...fillPctReasons,
+    'minStakeDeltaSol 이상: Rank 2 rank-two Fill 예상 +1,000 SOL (기준 1,000 SOL)',
+  ], { maxReasons: 2 });
+  assert.equal(summarized, 'minBidDeltaPmpe 이상: Rank 2 rank-two Bid +0.0005 PMPE (기준 0.0005 PMPE); minFillPctDelta 이상: Rank 2 rank-two Fill +1%p (기준 1%p); 외 1건');
 });
 
 test('Discord fill-rank messages wrap fixed-width tables in code blocks', () => {
