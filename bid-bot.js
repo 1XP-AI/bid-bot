@@ -1514,6 +1514,20 @@ async function runOnce() {
   return true;
 }
 
+function shouldRunMain({
+  moduleUrl = import.meta.url,
+  argv = process.argv,
+  pmExecPath = process.env.pm_exec_path,
+} = {}) {
+  const modulePath = fileURLToPath(moduleUrl);
+  const startedDirectly = argv[1]
+    && moduleUrl === pathToFileURL(resolve(argv[1])).href;
+  const startedByPm2 = typeof pmExecPath === 'string'
+    && pmExecPath !== ''
+    && resolve(pmExecPath) === modulePath;
+  return Boolean(startedDirectly || startedByPm2);
+}
+
 export {
   buildConfigureBondArgs,
   calculateEpochTiming,
@@ -1547,6 +1561,7 @@ export {
   shouldChangeBid,
   shouldCheckScheduledFillRankReport,
   shouldRefreshHeavyInputs,
+  shouldRunMain,
 };
 
 // ============================================================
@@ -1634,6 +1649,9 @@ async function main() {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  main();
+if (shouldRunMain()) {
+  main().catch((e) => {
+    log(`예상하지 못한 오류가 발생해 종료합니다. ${e.stack || e.message}`);
+    process.exit(1);
+  });
 }

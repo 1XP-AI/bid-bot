@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   buildConfigureBondArgs,
@@ -35,7 +36,31 @@ import {
   shouldChangeBid,
   shouldCheckScheduledFillRankReport,
   shouldRefreshHeavyInputs,
+  shouldRunMain,
 } from '../bid-bot.js';
+
+test('entrypoint runs when PM2 imports the ESM app through its wrapper', () => {
+  const moduleUrl = new URL('../bid-bot.js', import.meta.url).href;
+  const modulePath = fileURLToPath(moduleUrl);
+
+  assert.equal(shouldRunMain({
+    moduleUrl,
+    argv: ['node', modulePath, '--loop'],
+    pmExecPath: '',
+  }), true);
+
+  assert.equal(shouldRunMain({
+    moduleUrl,
+    argv: ['node', '/usr/lib/node_modules/pm2/lib/ProcessContainerFork.js'],
+    pmExecPath: modulePath,
+  }), true);
+
+  assert.equal(shouldRunMain({
+    moduleUrl,
+    argv: ['node', '/tmp/test-runner.js'],
+    pmExecPath: '',
+  }), false);
+});
 
 test('computeTargetBid keeps the highest safety floor and rounds to 4 decimals', () => {
   const target = computeTargetBid(0.04606689167741296, {
