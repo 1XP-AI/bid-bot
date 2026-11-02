@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  applyBid,
   buildConfigureBondArgs,
   calculateEpochTiming,
   capSingleDrop,
@@ -25,6 +26,7 @@ import {
   hasFillRankTableChanged,
   hasMaterialFillRankChange,
   isTargetInSanityRange,
+  isSupportedDsSamVersion,
   parseCpmpeBid,
   patchDsSamSdkForPrereleaseVersions,
   pmpeToCpmpeLamports,
@@ -33,10 +35,13 @@ import {
   renderFillRankImagePng,
   resolveMode,
   resolveManualBidFloor,
+  runDsSam,
   shouldChangeBid,
   shouldCheckScheduledFillRankReport,
   shouldRefreshHeavyInputs,
   shouldRunMain,
+  validateDsSamResult,
+  withOnchainBid,
 } from '../bid-bot.js';
 
 test('entrypoint runs when PM2 imports the ESM app through its wrapper', () => {
@@ -647,6 +652,156 @@ test('heavy inputs stay cached when live bonds epoch matches last ds-sam result 
   assert.equal(status.resultsEpoch, 982);
 });
 
+function auctionRunFixture(t) {
+  const root = mkdtempSync(join(tmpdir(), 'bid-bot-run-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const cacheDir = join(root, 'cache');
+  const outputDir = join(root, 'output');
+  mkdirSync(cacheDir);
+  mkdirSync(outputDir);
+  writeFileSync(join(cacheDir, 'bonds.json'), JSON.stringify({ bonds: [{ epoch: 1074 }] }));
+  const previous = JSON.stringify({ auctionData: { epoch: 1065 } });
+  writeFileSync(join(outputDir, 'results.json'), previous);
+  const messages = [];
+  const result = {
+    winningTotalPmpe: 0.1645,
+    auctionData: {
+      epoch: 1074,
+      validators: [{
+        voteAccount: 'vote-a',
+        revShare: { bidPmpe: 0.0242, effParticipatingBidPmpe: 0.0243, totalPmpe: 0.1644, bidTooLowPenaltyPmpe: 0 },
+      }],
+    },
+  };
+  return { cacheDir, outputDir, previous, result, messages, logger: message => messages.push(message) };
+}
+
+test('ds-sam exit 0 without new output cannot reuse an old successful auction', t => {
+  const f = auctionRunFixture(t);
+  assert.equal(runDsSam({
+    ...f,
+    runner: () => ({ status: 0, stdout: '', stderr: 'Error: [DecimalError] Invalid argument: null' }),
+  }), false);
+  assert.equal(readFileSync(join(f.outputDir, 'results.json'), 'utf8'), f.previous);
+  assert.deepEqual(readdirSync(f.outputDir), ['results.json']);
+  assert.match(f.messages.join('\n'), /DecimalError/);
+});
+
+test('ds-sam rejects newly written output from a different epoch', t => {
+  const f = auctionRunFixture(t);
+  f.result.auctionData.epoch = 1065;
+  assert.equal(runDsSam({
+    ...f,
+    runner: (command, args) => {
+      writeFileSync(join(args[args.indexOf('-o') + 1], 'results.json'), JSON.stringify(f.result));
+      return { status: 0 };
+    },
+  }), false);
+  assert.equal(readFileSync(join(f.outputDir, 'results.json'), 'utf8'), f.previous);
+  assert.match(f.messages.join('\n'), /1065.*1074/);
+});
+
+test('ds-sam publishes only a fresh validated auction and cleans temporary files', t => {
+  const f = auctionRunFixture(t);
+  assert.equal(runDsSam({
+    ...f,
+    runner: (command, args) => {
+      const runDir = args[args.indexOf('-o') + 1];
+      writeFileSync(join(runDir, 'results.json'), JSON.stringify(f.result));
+      writeFileSync(join(runDir, 'summary.md'), 'new summary');
+      return { status: 0 };
+    },
+  }), true);
+  assert.deepEqual(JSON.parse(readFileSync(join(f.outputDir, 'results.json'))), f.result);
+  assert.deepEqual(readdirSync(f.outputDir).sort(), ['results.json', 'summary.md']);
+});
+
+test('ds-sam nonzero exit cannot publish output even when the epoch matches', t => {
+  const f = auctionRunFixture(t);
+  assert.equal(runDsSam({
+    ...f,
+    runner: (command, args) => {
+      writeFileSync(join(args[args.indexOf('-o') + 1], 'results.json'), JSON.stringify(f.result));
+      return { status: 1, stdout: 'SDK failure on stdout', stderr: '' };
+    },
+  }), false);
+  assert.equal(readFileSync(join(f.outputDir, 'results.json'), 'utf8'), f.previous);
+  assert.match(f.messages.join('\n'), /SDK failure on stdout/);
+});
+
+test('ds-sam does not run when the live bonds epoch is unavailable', t => {
+  const f = auctionRunFixture(t);
+  writeFileSync(join(f.cacheDir, 'bonds.json'), '{}');
+  assert.equal(runDsSam({ ...f, runner: () => assert.fail('must not run without a live epoch') }), false);
+});
+
+test('ds-sam validation rejects null cutoff and malformed bid calculations', t => {
+  const { result } = auctionRunFixture(t);
+  assert.equal(validateDsSamResult(result, 1074), null);
+  result.winningTotalPmpe = null;
+  assert.match(validateDsSamResult(result, 1074), /winningTotalPmpe/);
+  result.winningTotalPmpe = 0.1645;
+  result.auctionData.validators[0].revShare.effParticipatingBidPmpe = null;
+  assert.match(validateDsSamResult(result, 1074), /vote-a/);
+});
+
+test('ds-sam requires a release with Alpenglow support', () => {
+  for (const version of ['0.3.0', '0.6.4', '0.6.6-beta.1', null]) {
+    assert.equal(isSupportedDsSamVersion(version), false);
+  }
+  for (const version of ['0.6.5', '0.6.6', '0.7.0', '1.0.0']) {
+    assert.equal(isSupportedDsSamVersion(version), true);
+  }
+});
+
+test('on-chain bid replaces only the matching bond without modifying API data', () => {
+  const data = { bonds: [
+    { pubkey: 'bond-a', vote_account: 'vote-a', cpmpe: '24200000', epoch: 1074 },
+    { pubkey: 'other-product', vote_account: 'vote-a', cpmpe: '10000000', epoch: 1074 },
+    { pubkey: 'bond-b', vote_account: 'vote-b', cpmpe: '50000000', epoch: 1074 },
+  ] };
+  const result = withOnchainBid(data, { bondAccount: 'bond-a', voteAccount: 'vote-a', bid: 0.0249 });
+  assert.equal(result.bonds[0].cpmpe, '24900000');
+  assert.equal(result.bonds[0].epoch, 1074);
+  assert.equal(data.bonds[0].cpmpe, '24200000');
+  assert.deepEqual(result.bonds.slice(1), data.bonds.slice(1));
+  assert.equal(withOnchainBid(data.bonds, { bondAccount: 'bond-a', voteAccount: 'vote-a', bid: 0.0249 })[0].cpmpe, '24900000');
+});
+
+test('on-chain bid override rejects missing bonds, wrong votes, and invalid bids', () => {
+  const data = { bonds: [{ pubkey: 'bond-a', vote_account: 'vote-a', cpmpe: '24200000' }] };
+  for (const override of [
+    { bondAccount: 'missing', voteAccount: 'vote-a', bid: 0.0249 },
+    { bondAccount: 'bond-a', voteAccount: 'wrong-vote', bid: 0.0249 },
+    { bondAccount: 'bond-a', voteAccount: 'vote-a', bid: NaN },
+    { bondAccount: 'bond-a', voteAccount: 'vote-a', bid: -0.01 },
+  ]) assert.throws(() => withOnchainBid(data, override));
+});
+
+test('auction inputs use the on-chain bid even when the bonds API still has the old bid', t => {
+  const f = auctionRunFixture(t);
+  const apiBonds = { bonds: [{ pubkey: 'bond-a', vote_account: 'vote-a', cpmpe: '24200000', epoch: 1074 }] };
+  writeFileSync(join(f.cacheDir, 'bonds.json'), JSON.stringify(apiBonds));
+  for (const file of ['config.json', 'validators.json', 'mev-info.json', 'rewards.json', 'tvl-info.json', 'blacklist.csv', 'auctions.json']) {
+    writeFileSync(join(f.cacheDir, file), '{}');
+  }
+  assert.equal(runDsSam({
+    ...f,
+    onchainBond: { bondAccount: 'bond-a', voteAccount: 'vote-a', bid: 0.0249 },
+    runner: (command, args) => {
+      const inputsDir = args[args.indexOf('--cache-dir-path') + 1];
+      assert.notEqual(inputsDir, f.cacheDir);
+      const bonds = JSON.parse(readFileSync(join(inputsDir, 'bonds.json')));
+      assert.equal(bonds.bonds[0].cpmpe, '24900000');
+      f.result.auctionData.validators[0].revShare.bidPmpe = 0.0249;
+      writeFileSync(join(args[args.indexOf('-o') + 1], 'results.json'), JSON.stringify(f.result));
+      return { status: 0 };
+    },
+  }), true);
+  assert.deepEqual(JSON.parse(readFileSync(join(f.cacheDir, 'bonds.json'))), apiBonds);
+  assert.deepEqual(readdirSync(f.outputDir), ['results.json']);
+});
+
 test('refreshHeavyFiles reports failed heavy inputs before calculation can continue', async () => {
   const files = [
     ['validators.json', 'https://example.invalid/validators'],
@@ -724,6 +879,59 @@ test('configure-bond args add force only for explicit bid decreases', () => {
   );
 });
 
+test('bid application confirms the account instead of trusting CLI exit 0', () => {
+  const messages = [];
+  const applied = applyBid('bond-a', 0.0249, 0.0242, {
+    dryRun: false,
+    runner: () => ({ status: 0, stdout: 'command finished' }),
+    readBond: () => ({ bid: 0.0242 }),
+    logger: message => messages.push(message),
+  });
+  assert.equal(applied, false);
+  assert.match(messages.join('\n'), /목표 0.0249 PMPE, 현재 0.0242 PMPE/);
+});
+
+test('bid application succeeds only after observing the target on-chain', () => {
+  assert.equal(applyBid('bond-a', 0.0249, 0.0242, {
+    dryRun: false,
+    runner: () => ({ status: 0 }),
+    readBond: () => ({ bid: 0.0249 }),
+    logger: () => {},
+  }), true);
+});
+
+test('bid application preserves RPC error details when submission fails', () => {
+  const messages = [];
+  const detail = '[validator-bonds RPC error] {"code":-32002,"err":"BlockhashNotFound","logs":[]}';
+  assert.equal(applyBid('bond-a', 0.0249, 0.0242, {
+    dryRun: false,
+    runner: () => ({ status: 1, stderr: detail }),
+    readBond: () => ({ bid: 0.0242 }),
+    logger: message => messages.push(message),
+  }), false);
+  assert.ok(messages.some(message => message.includes(detail)));
+});
+
+test('a CLI timeout after successful submission is resolved by reading the bond', () => {
+  let calls = 0;
+  assert.equal(applyBid('bond-a', 0.0249, 0.0242, {
+    dryRun: false,
+    runner: () => { calls++; return { status: null, error: { code: 'ETIMEDOUT', message: 'timed out' } }; },
+    readBond: () => ({ bid: 0.0249 }),
+    logger: () => {},
+  }), true);
+  assert.equal(calls, 1);
+});
+
+test('dry-run neither submits a transaction nor performs post-submission verification', () => {
+  assert.equal(applyBid('bond-a', 0.0249, 0.0242, {
+    dryRun: true,
+    runner: () => assert.fail('dry-run must not submit'),
+    readBond: () => assert.fail('there was no submission to verify'),
+    logger: () => {},
+  }), true);
+});
+
 test('ds-sam patch allows prerelease client versions in semver checks', () => {
   const before = 'if (!semver.satisfies(validator.clientVersion, this.config.validatorsClientVersionSemverExpr)) return false';
   const result = patchDsSamSdkForPrereleaseVersions(before);
@@ -736,4 +944,11 @@ test('ds-sam patch allows prerelease client versions in semver checks', () => {
   assert.equal(second.patched, false);
   assert.equal(second.alreadyPatched, true);
   assert.equal(second.source, result.source);
+});
+
+test('ds-sam recognizes native prerelease support in the current eligibility module', () => {
+  const source = `semver.satisfies(validator.clientVersion, config.validatorsClientVersionSemverExpr, {
+    includePrerelease: true,
+  })`;
+  assert.deepEqual(patchDsSamSdkForPrereleaseVersions(source), { source, patched: false, alreadyPatched: true });
 });

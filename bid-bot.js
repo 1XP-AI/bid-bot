@@ -14,7 +14,7 @@
 
 import {
   existsSync, readFileSync, writeFileSync, appendFileSync,
-  statSync, mkdirSync, renameSync, copyFileSync,
+  statSync, mkdirSync, mkdtempSync, renameSync, rmSync, copyFileSync,
   accessSync, constants,
 } from 'fs';
 import { spawnSync } from 'child_process';
@@ -77,6 +77,7 @@ const PIPELINE_DIR  = rel(get('PIPELINE_DIR',  'dssam.pipelineDir',  './ds-sam-p
 const CACHE_DIR     = rel(get('CACHE_DIR',     'dssam.cacheDir',     './ds-sam-cache'));
 const OUTPUT_DIR    = rel(get('OUTPUT_DIR',    'dssam.outputDir',    './ds-sam-output'));
 const HEAVY_CACHE_TTL = +get('HEAVY_CACHE_TTL', 'dssam.heavyCacheTtl', 86400);
+const DSSAM_REF = 'v0.6.6';
 
 const SAFETY_RATIO        = +get('SAFETY_RATIO',        'bidStrategy.safetyRatio',       1.05);
 const WIN_BUFFER_PMPE     = +get('WIN_BUFFER_PMPE',     'bidStrategy.winBufferPmpe',     0.0005);
@@ -481,7 +482,9 @@ function pnpmEnv(extra = {}) {
 function patchDsSamSdkForPrereleaseVersions(source) {
   const target = 'semver.satisfies(validator.clientVersion, this.config.validatorsClientVersionSemverExpr)';
   const replacement = 'semver.satisfies(validator.clientVersion, this.config.validatorsClientVersionSemverExpr, { includePrerelease: true })';
-  if (source.includes(replacement)) return { source, patched: false, alreadyPatched: true };
+  if (/semver\.satisfies\(validator\.clientVersion,\s*(?:this\.)?config\.validatorsClientVersionSemverExpr,\s*\{\s*includePrerelease:\s*true,?\s*\}/.test(source)) {
+    return { source, patched: false, alreadyPatched: true };
+  }
   if (!source.includes(target)) return { source, patched: false, alreadyPatched: false };
   return {
     source: source.replace(target, replacement),
@@ -490,7 +493,10 @@ function patchDsSamSdkForPrereleaseVersions(source) {
   };
 }
 function applyDsSamCompatibilityPatches() {
-  const sdkPath = `${DSSAM_DIR}/packages/ds-sam-sdk/src/sdk.ts`;
+  const eligibilityPath = `${DSSAM_DIR}/packages/ds-sam-sdk/src/eligibility.ts`;
+  const sdkPath = existsSync(eligibilityPath)
+    ? eligibilityPath
+    : `${DSSAM_DIR}/packages/ds-sam-sdk/src/sdk.ts`;
   if (!existsSync(sdkPath)) return false;
   const original = readFileSync(sdkPath, 'utf8');
   const result = patchDsSamSdkForPrereleaseVersions(original);
@@ -685,9 +691,17 @@ function ensurePnpm() {
 // ============================================================
 // ds-sam 자동 설치
 // ============================================================
+function isSupportedDsSamVersion(version) {
+  const parts = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(version ?? ''));
+  if (!parts) return false;
+  const [, major, minor, patch] = parts.map(Number);
+  return major > 0 || minor > 6 || (minor === 6 && patch >= 5);
+}
+
 function ensureDsSamReady() {
-  const buildReady = existsSync(`${DSSAM_DIR}/dist`)
-                  && existsSync(`${DSSAM_DIR}/packages/ds-sam-sdk/dist`);
+  const buildReady = existsSync(`${DSSAM_DIR}/dist/src/cli.js`)
+                  && existsSync(`${DSSAM_DIR}/packages/ds-sam-sdk/dist/src/index.js`)
+                  && existsSync(`${DSSAM_DIR}/packages/ds-sam-calc/dist/src/uptime.js`);
   const need = !existsSync(DSSAM_DIR)
             || !existsSync(`${DSSAM_DIR}/node_modules`)
             || !existsSync(PIPELINE_DIR)
@@ -710,8 +724,12 @@ function ensureDsSamReady() {
 
   if (!existsSync(DSSAM_DIR)) {
     log(`ds-sam 저장소를 받습니다. 위치: ${DSSAM_DIR}`);
-    if (spawnSetupCommand('git', ['clone', 'https://github.com/marinade-finance/ds-sam.git', DSSAM_DIR],
+    if (spawnSetupCommand('git', ['clone', '--branch', DSSAM_REF, '--depth', '1', 'https://github.com/marinade-finance/ds-sam.git', DSSAM_DIR],
                   { stdio: 'inherit' }).status !== 0) die('clone 실패');
+  }
+  const sdkVersion = readJsonFile(`${DSSAM_DIR}/packages/ds-sam-sdk/package.json`)?.version;
+  if (!isSupportedDsSamVersion(sdkVersion)) {
+    die(`ds-sam SDK ${sdkVersion ?? 'unknown'}는 현재 Alpenglow API와 호환되지 않습니다. ds-sam을 ${DSSAM_REF}로 업데이트하고 pnpm install 및 pnpm -r --include-workspace-root build를 실행하세요. README의 업데이트 절차를 확인하세요.`);
   }
   if (!existsSync(PIPELINE_DIR)) {
     log(`ds-sam-pipeline 저장소를 받습니다. 위치: ${PIPELINE_DIR}`);
@@ -729,7 +747,7 @@ function ensureDsSamReady() {
   if (!need && !patched) return;
   if (!buildReady || patched) {
     log('ds-sam을 빌드합니다.');
-    if (spawnSetupCommand('pnpm', ['--config.verify-deps-before-run=false', '-r', 'build'],
+    if (spawnSetupCommand('pnpm', ['--config.verify-deps-before-run=false', '-r', '--include-workspace-root', 'build'],
                   { cwd: DSSAM_DIR, stdio: 'inherit', env: pnpmEnv() }).status !== 0)
       die('build 실패');
   }
@@ -741,6 +759,7 @@ function ensureDsSamReady() {
 // 데이터 fetch
 // ============================================================
 const HEAVY_FILES = [
+  ['config.json',    'https://raw.githubusercontent.com/marinade-finance/ds-sam-pipeline/main/auction-config.json'],
   ['validators.json', 'https://validators-api.marinade.finance/validators?epochs=11&limit=1000000'],
   ['mev-info.json',   'https://validators-api.marinade.finance/mev'],
   ['rewards.json',    'https://validators-api.marinade.finance/rewards?epochs=10'],
@@ -775,8 +794,6 @@ async function fetchHeavyIfStale(force = false) {
     log(`검증용 보조 데이터 갱신에 실패했습니다. 실패 파일: ${failedFiles.join(', ')}. 오래된 cache로 계산하지 않기 위해 이번 회차를 중단합니다.`);
     return false;
   }
-  const cfgSrc = `${PIPELINE_DIR}/auction-config.json`;
-  if (existsSync(cfgSrc)) copyFileSync(cfgSrc, `${CACHE_DIR}/config.json`);
   logVerbose('검증용 보조 데이터 갱신이 끝났습니다.');
   return true;
 }
@@ -794,36 +811,99 @@ async function refreshHeavyFiles(files, cacheDir, downloader = downloadFile) {
 // ============================================================
 // ds-sam 실행
 // ============================================================
-function runDsSam() {
+function runDsSam(opts = {}) {
+  const cacheDir = opts.cacheDir ?? CACHE_DIR;
+  const outputDir = opts.outputDir ?? OUTPUT_DIR;
+  const runner = opts.runner ?? spawnSync;
+  const logger = opts.logger ?? log;
+  const expectedEpoch = readCachedBondsEpoch(cacheDir);
+  if (!Number.isSafeInteger(expectedEpoch) || expectedEpoch < 0) {
+    logger('❌ 최신 bond 데이터에서 epoch을 확인하지 못해 계산을 중단합니다.');
+    return false;
+  }
+  // nest-commander can report an SDK error and still exit 0. Only a newly
+  // produced, validated result may replace the previous successful output.
+  const runDir = mkdtempSync(`${outputDir}/.run-`);
   logVerbose('Marinade SAM 경매 계산을 실행합니다.');
   const start = Date.now();
-  const r = spawnSync('pnpm', ['--config.verify-deps-before-run=false', 'run', 'cli', '--', 'auction',
-    '-c',                  `${CACHE_DIR}/config.json`,
-    '--inputs-source',     'FILES',
-    '--cache-dir-path',    CACHE_DIR,
-    '-o',                  OUTPUT_DIR,
-  ], {
-    cwd: DSSAM_DIR,
-    timeout: DSSAM_TIMEOUT_MS,
-    env: pnpmEnv(),
-    stdio: ['ignore', 'ignore', 'pipe'],
-    maxBuffer: 10 * 1024 * 1024,
+  try {
+    let inputsDir = cacheDir;
+    if (opts.onchainBond) {
+      inputsDir = `${runDir}/inputs`;
+      mkdirSync(inputsDir);
+      for (const [file] of HEAVY_FILES) copyFileSync(`${cacheDir}/${file}`, `${inputsDir}/${file}`);
+      const bonds = withOnchainBid(readJsonFile(`${cacheDir}/bonds.json`), opts.onchainBond);
+      writeFileSync(`${inputsDir}/bonds.json`, JSON.stringify(bonds));
+    }
+    const r = runner(process.execPath, [`${DSSAM_DIR}/dist/src/cli.js`, 'auction',
+      '-c',                  `${inputsDir}/config.json`,
+      '--inputs-source',     'FILES',
+      '--cache-dir-path',    inputsDir,
+      '-o',                  runDir,
+    ], {
+      cwd: DSSAM_DIR,
+      timeout: DSSAM_TIMEOUT_MS,
+      env: pnpmEnv(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+    if (timedOut(r)) {
+      logger(`❌ Marinade SAM 계산이 ${elapsed}초 동안 끝나지 않아 중단했습니다.`);
+      return false;
+    }
+    if (r.error) {
+      logger(`❌ Marinade SAM 계산을 시작하지 못했습니다. 걸린 시간: ${elapsed}초, 이유: ${r.error.message}`);
+      return false;
+    }
+    const result = readJsonFile(`${runDir}/results.json`);
+    const validationError = validateDsSamResult(result, expectedEpoch);
+    if (r.status !== 0 || validationError) {
+      const output = `${r.stdout || ''}\n${r.stderr || ''}`.trim().slice(-1500);
+      logger(`❌ Marinade SAM 계산이 실패했습니다. 걸린 시간: ${elapsed}초, 이유: ${validationError ?? `exit ${r.status}`}. 마지막 출력: ${output}`);
+      return false;
+    }
+    renameSync(`${runDir}/results.json`, `${outputDir}/results.json`);
+    if (existsSync(`${runDir}/summary.md`)) renameSync(`${runDir}/summary.md`, `${outputDir}/summary.md`);
+    logVerbose(`Marinade SAM 경매 계산이 끝났습니다. 걸린 시간: ${elapsed}초`);
+    return true;
+  } finally {
+    rmSync(runDir, { recursive: true, force: true });
+  }
+}
+
+function withOnchainBid(data, { bondAccount, voteAccount, bid }) {
+  const cpmpe = pmpeToCpmpeLamports(bid);
+  if (!Number.isSafeInteger(cpmpe) || cpmpe < 0) throw new Error('유효하지 않은 on-chain bid입니다');
+  const rows = Array.isArray(data) ? data : data?.bonds;
+  if (!Array.isArray(rows)) throw new Error('유효하지 않은 bonds 입력입니다');
+  let found = false;
+  const bonds = rows.map(row => {
+    if (row.pubkey !== bondAccount || row.vote_account !== voteAccount) return row;
+    found = true;
+    return { ...row, cpmpe: String(cpmpe) };
   });
-  const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-  if (timedOut(r)) {
-    log(`❌ Marinade SAM 계산이 ${elapsed}초 동안 끝나지 않아 중단했습니다.`);
-    return false;
+  if (!found) throw new Error(`live bonds 입력에 내 bond ${bondAccount}가 없습니다`);
+  return Array.isArray(data) ? bonds : { ...data, bonds };
+}
+
+function validateDsSamResult(result, expectedEpoch) {
+  if (!result) return '이번 실행에서 새 results.json이 생성되지 않았습니다';
+  if (result.auctionData?.epoch !== expectedEpoch) {
+    return `계산 epoch(${result.auctionData?.epoch ?? '없음'})과 live bonds epoch(${expectedEpoch})이 다릅니다`;
   }
-  if (r.error) {
-    log(`❌ Marinade SAM 계산을 시작하지 못했습니다. 걸린 시간: ${elapsed}초, 이유: ${r.error.message}`);
-    return false;
+  if (!Number.isFinite(result.winningTotalPmpe) || result.winningTotalPmpe <= 0) {
+    return 'winningTotalPmpe가 유효하지 않습니다';
   }
-  if (r.status !== 0) {
-    log(`❌ Marinade SAM 계산이 실패했습니다. 걸린 시간: ${elapsed}초, 마지막 오류: ${(r.stderr || '').toString().slice(-500)}`);
-    return false;
+  const validators = result.auctionData?.validators;
+  if (!Array.isArray(validators) || validators.length === 0) return 'validator 결과가 없습니다';
+  for (const validator of validators) {
+    const share = validator.revShare;
+    if (![share?.bidPmpe, share?.effParticipatingBidPmpe, share?.totalPmpe, share?.bidTooLowPenaltyPmpe].every(Number.isFinite)) {
+      return `validator ${validator.voteAccount}의 입찰 계산값이 유효하지 않습니다`;
+    }
   }
-  logVerbose(`Marinade SAM 경매 계산이 끝났습니다. 걸린 시간: ${elapsed}초`);
-  return true;
+  return null;
 }
 
 function extractMyStatus() {
@@ -1348,32 +1428,58 @@ function buildConfigureBondArgs(bondAccount, cpmpeLamports, opts = {}) {
   return args;
 }
 
-function applyBid(bondAccount, newBid, currentBid) {
+function applyBid(bondAccount, newBid, currentBid, opts = {}) {
+  const runner = opts.runner ?? spawnSync;
+  const readBond = opts.readBond ?? readOnchainBond;
+  const logger = opts.logger ?? log;
+  const dryRun = opts.dryRun ?? dryRunActive;
   const cpmpeLamports = pmpeToCpmpeLamports(newBid);
   if (cpmpeLamports == null) {
-    log(`❌ bid 값이 숫자가 아니라 적용하지 않습니다. 값: ${newBid}`);
+    logger(`❌ bid 값이 숫자가 아니라 적용하지 않습니다. 값: ${newBid}`);
     return false;
   }
   const forceDecrease = Number.isFinite(currentBid) && currentBid - newBid > Number.EPSILON;
   const args = buildConfigureBondArgs(bondAccount, cpmpeLamports, {
     force: forceDecrease,
   });
-  if (dryRunActive) {
+  if (dryRun) {
     const forceText = forceDecrease ? ' bid 인하라 --force를 함께 사용합니다.' : '';
-    log(`DRY_RUN입니다. 실제 트랜잭션은 보내지 않고 cpmpe=${cpmpeLamports} 적용 명령만 확인했습니다.${forceText}`);
+    logger(`DRY_RUN입니다. 실제 트랜잭션은 보내지 않고 cpmpe=${cpmpeLamports} 적용 명령만 확인했습니다.${forceText}`);
     return true;
   }
   if (forceDecrease && !validatorBondsSupportsForce()) {
-    log('❌ 현재 validator-bonds CLI가 --force를 지원하지 않아 bid 인하를 적용할 수 없습니다. npm install -g @marinade.finance/validator-bonds-cli@latest 후 다시 실행하세요.');
+    logger('❌ 현재 validator-bonds CLI가 --force를 지원하지 않아 bid 인하를 적용할 수 없습니다. npm install -g @marinade.finance/validator-bonds-cli@latest 후 다시 실행하세요.');
     return false;
   }
   if (forceDecrease) {
-    log('bid를 낮추는 변경이라 validator-bonds --force를 함께 사용합니다.');
+    logger('bid를 낮추는 변경이라 validator-bonds --force를 함께 사용합니다.');
   }
-  log(`on-chain bid 변경 트랜잭션을 보냅니다. 새 bid: ${fmtPmpe(newBid)}`);
-  const r = spawnSync('validator-bonds', args, { stdio: 'inherit', timeout: BOND_CLI_TIMEOUT_MS });
-  if (timedOut(r)) log('❌ bid 변경 트랜잭션이 시간 안에 끝나지 않았습니다.');
-  return r.status === 0;
+  logger(`on-chain bid 변경 트랜잭션을 보냅니다. 새 bid: ${fmtPmpe(newBid)}`);
+  const preload = resolve(__dirname, 'validator-bonds-rpc-diagnostics.cjs');
+  const r = runner('validator-bonds', args, {
+    encoding: 'utf8',
+    timeout: BOND_CLI_TIMEOUT_MS,
+    maxBuffer: 2 * 1024 * 1024,
+    env: {
+      ...process.env,
+      BID_BOT_RPC_DIAGNOSTICS: '1',
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${JSON.stringify(preload)}`.trim(),
+    },
+  });
+  const output = `${r.stdout || ''}\n${r.stderr || ''}`.trim();
+  if (output) logger(`validator-bonds 출력:\n${output.slice(-12000)}`);
+  if (timedOut(r)) logger('❌ bid 변경 트랜잭션이 시간 안에 끝나지 않았습니다.');
+  if (r.error) logger(`❌ validator-bonds 실행 오류: ${r.error.message}`);
+  // A timeout can occur after submission, while exit 0 alone does not prove
+  // the bid changed. Confirm the account before reporting or recording success.
+  const onchain = readBond(bondAccount);
+  if (onchain && pmpeToCpmpeLamports(onchain.bid) === cpmpeLamports) {
+    logger(`on-chain bid 적용을 확인했습니다. 현재 bid: ${fmtPmpe(onchain.bid)}`);
+    return true;
+  }
+  const actual = onchain ? fmtPmpe(onchain.bid) : '조회 실패';
+  logger(`❌ bid 변경을 확인하지 못했습니다. validator-bonds exit=${r.status ?? r.signal ?? 'unknown'}, 목표 ${fmtPmpe(newBid)}, 현재 ${actual}.`);
+  return false;
 }
 
 // ============================================================
@@ -1393,7 +1499,26 @@ async function runOnce() {
     return false;
   }
 
-  if (!runDsSam()) {
+  const readOnly = MODE === 'status' || MODE === 'fill-rank';
+  const bondAccount = resolveBondAccount();
+  if (!bondAccount && !readOnly) {
+    log('❌ bond account를 찾지 못해 on-chain 상태를 확인할 수 없습니다.');
+    await notifyDiscord('❌ `bid-bot`: bond account 조회에 실패해 이번 회차를 중단했습니다.');
+    return false;
+  }
+  const onchain = bondAccount ? readOnchainBond(bondAccount) : null;
+  if (!onchain && !readOnly) {
+    log('❌ on-chain bond 상태를 읽지 못해 bid를 변경하지 않습니다.');
+    await notifyDiscord('❌ `bid-bot`: on-chain bond 상태 조회에 실패해 이번 회차를 중단했습니다.');
+    return false;
+  }
+  if (onchain) {
+    logVerbose(`현재 on-chain bid는 ${fmtPmpe(onchain.bid)}입니다. API 반영 지연을 피하기 위해 경매 계산 입력에 이 값을 사용합니다.`);
+  } else {
+    log('ℹ️ 읽기 전용 조회에서 on-chain bid를 확인할 수 없어 bonds API 값을 사용합니다.');
+  }
+
+  if (!runDsSam(onchain ? { onchainBond: { bondAccount, voteAccount: VOTE_ADDR, bid: onchain.bid } } : {})) {
     await notifyDiscord('❌ `bid-bot`: Marinade SAM 경매 계산이 실패해 이번 회차를 중단했습니다.');
     return false;
   }
@@ -1438,22 +1563,6 @@ async function runOnce() {
     log(`⚠️ 계산된 목표 bid ${fmtPmpe(target)}가 안전 범위(${fmtPmpe(MIN_SANITY_BID)}~${fmtPmpe(MAX_SANITY_BID)}) 밖이라 변경하지 않습니다.`);
     return true;
   }
-
-  const bondAccount = resolveBondAccount();
-  if (!bondAccount) {
-    log('❌ bond account를 찾지 못해 on-chain 상태를 확인할 수 없습니다.');
-    await notifyDiscord('❌ `bid-bot`: bond account 조회에 실패해 이번 회차를 중단했습니다.');
-    return true;
-  }
-  logVerbose(`bond account를 확인했습니다. account: ${fmtAccount(bondAccount)}`);
-
-  const onchain = readOnchainBond(bondAccount);
-  if (!onchain) {
-    log('❌ on-chain bond 상태를 읽지 못해 bid를 변경하지 않습니다.');
-    await notifyDiscord('❌ `bid-bot`: on-chain bond 상태 조회에 실패해 이번 회차를 중단했습니다.');
-    return true;
-  }
-  logVerbose(`현재 on-chain bid는 ${fmtPmpe(onchain.bid)}입니다.`);
 
   if (!shouldChangeBid(onchain.bid, target)) {
     if (showCalculationTable) {
@@ -1529,6 +1638,7 @@ function shouldRunMain({
 }
 
 export {
+  applyBid,
   buildConfigureBondArgs,
   calculateEpochTiming,
   capSingleDrop,
@@ -1547,6 +1657,7 @@ export {
   formatFillRankTable,
   fmtDuration,
   isTargetInSanityRange,
+  isSupportedDsSamVersion,
   parseCpmpeBid,
   patchDsSamSdkForPrereleaseVersions,
   pmpeToCpmpeLamports,
@@ -1558,10 +1669,13 @@ export {
   describeMaterialFillRankChanges,
   resolveManualBidFloor,
   resolveMode,
+  runDsSam,
   shouldChangeBid,
   shouldCheckScheduledFillRankReport,
   shouldRefreshHeavyInputs,
   shouldRunMain,
+  validateDsSamResult,
+  withOnchainBid,
 };
 
 // ============================================================
@@ -1645,7 +1759,9 @@ async function main() {
       await new Promise(r => setTimeout(r, loopDelayMs));
     }
   } else {
-    try { await runOnce(); } catch (e) { log(`예상하지 못한 오류가 발생해 종료합니다. ${e.stack || e.message}`); process.exit(1); }
+    try {
+      if (!(await runOnce())) process.exitCode = 1;
+    } catch (e) { log(`예상하지 못한 오류가 발생해 종료합니다. ${e.stack || e.message}`); process.exit(1); }
   }
 }
 

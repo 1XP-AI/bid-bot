@@ -19,6 +19,7 @@ Marinade SAM 자동 bid 관리 봇. 로컬에서 ds-sam SDK를 직접 실행해 
 - `git`
 - `curl`
 - `validator-bonds` CLI 2.4.6 이상 (`npm install -g @marinade.finance/validator-bonds-cli@latest`)
+- ds-sam SDK 0.6.5 이상 (신규 setup은 v0.6.6 설치). Alpenglow 전환 이후 `credits=null` 데이터는 구버전 SDK로 계산할 수 없습니다.
 - 실전 bid 적용용 Marinade config account keypair (`validator.authFile`, `validator.keypairFile`에 지정)
 
 `pnpm`은 자동으로 설치 시도합니다 (corepack / npm / standalone installer 순).
@@ -406,9 +407,9 @@ receivers = validators
 [pm2 --loop / 직접 --loop]
         ↓
 1. ds-sam 환경 체크 → 없으면 자동 설치
-2. bonds.json fetch (live, 매번; 실패 시 stale cache 적용 방지를 위해 중단)
-3. 나머지 입력 fetch (24h 캐시)
-4. ds-sam 로컬 실행 (5~10초)
+2. bonds.json fetch 및 내 bid on-chain 조회 (API 반영이 늦어도 내 cpmpe는 온체인 값 사용)
+3. 공식 auction-config 및 나머지 입력 fetch (24h 캐시, epoch 변경 시 갱신)
+4. 빌드된 ds-sam CLI 실행 → 새 결과 생성과 live bonds epoch 일치 검증 후 결과 교체
 5. results.json에서 내 validator 추출
 6. 모드별 처리
    - --status: 내 validator JSON 출력 후 종료
@@ -461,13 +462,39 @@ corepack enable
 corepack prepare pnpm@latest --activate
 ```
 
+**`Simulation failed`와 `Logs: []`만 출력됨**
+
+validator-bonds의 web3.js 전송 경로가 RPC의 상세 `error.data.err`를 오류 메시지에서 누락할 수 있습니다. 봇은 해당 응답을 `[validator-bonds RPC error]`로 기록하고 CLI 출력도 `bid-bot.log`에 남깁니다. 이 기록의 `err`와 `logs`로 원인을 확인하세요. 진단용 preload는 요청과 응답, preflight 설정을 변경하지 않습니다.
+
+트랜잭션 실행 후에는 CLI 종료 코드와 별도로 bond의 실제 cpmpe를 다시 조회합니다. 목표값이 확인되어야 성공 알림과 state를 기록하며, timeout 이후에도 이미 적용된 변경을 성공으로 확인할 수 있습니다.
+
+bonds API가 방금 변경한 bid를 아직 반영하지 못해도, 다음 경매 계산에는 내 bond의 온체인 cpmpe를 사용합니다. 원본 API cache를 보존하고 해당 실행의 임시 입력에만 반영하므로 계산표의 `My Total PMPE`, `Winning Margin`, `SAM Target`도 내 실제 bid를 기준으로 다시 계산합니다.
+
 **"ds-sam build 실패"**
 ```bash
 # 수동 재시도
 cd ds-sam
 pnpm install --frozen-lockfile
-pnpm -r build
+pnpm -r --include-workspace-root build
 ```
+
+**계산 epoch이 계속 과거에 머무르거나 `[DecimalError] Invalid argument: null`이 발생함**
+
+Alpenglow 전환 이후 API는 vote credits 대신 vote rewards 기반 데이터를 제공합니다. ds-sam SDK 0.6.5 이상이 필요합니다. 구버전 CLI는 계산 실패에도 종료 코드 0을 반환할 수 있으므로, 봇은 매 실행마다 별도 임시 디렉터리에서 새 결과가 생성되었는지 확인하고 live bonds와 epoch이 다르면 입찰을 중단합니다. 경매 설정도 로컬 pipeline 사본 대신 공식 원격 파일에서 갱신합니다.
+
+운영 loop를 먼저 중지한 뒤 SDK를 업데이트합니다. 로컬 수정이 있으면 먼저 보관하고, 아래 fast-forward가 실패하면 변경 사항을 확인하세요.
+
+```bash
+cd ds-sam
+git fetch origin --tags
+git merge --ff-only v0.6.6
+CI=true pnpm install --frozen-lockfile --config.engine-strict=false --ignore-scripts
+pnpm -r --include-workspace-root build
+cd ..
+node bid-bot.js --dry-run --force-refresh
+```
+
+새 결과의 epoch과 입찰가를 확인한 뒤 운영 PM2/loop를 재시작합니다. `validator-bonds` CLI만 업데이트해도 ds-sam SDK는 자동으로 업데이트되지 않습니다.
 
 **"validator가 결과에 없음"**
 - vote account가 Marinade validator 목록에 있는지 먼저 확인
@@ -484,7 +511,7 @@ pnpm -r build
 1. **4중 floor**: penalty/winning/safety/recent-min floor 동시 고려
 2. **MIN_SANITY_BID, MAX_SANITY_BID**: 비정상 값 차단
 3. **MAX_SINGLE_DROP**: 큰 폭 인하 방지 (단계적)
-4. **stale cache 차단**: live/heavy 데이터 갱신 실패 시 오래된 입력으로 적용하지 않음
+4. **stale cache/결과 차단**: live/heavy 데이터 갱신 실패, 새 결과 미생성, epoch 불일치, 유효하지 않은 계산값이면 입찰 중단
 5. **DRY_RUN 모드**: 며칠 시뮬레이션 후 실전
 6. **MIN_BID_CHANGE_PMPE**: 미세 변동 무시 (불필요한 tx 방지)
 
