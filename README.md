@@ -160,6 +160,8 @@ pm2 save  # 재부팅 후 자동 시작
 
 `--loop`는 시작 로그를 한 번만 출력하고, 매 회차 계산표를 표시합니다. 반복 실행 중에는 고정 설정값을 매번 늘어놓지 않고 계산 결과, 경고, 실패, 실제 bid 변경처럼 확인이 필요한 내용 위주로 남깁니다.
 
+데이터 조회나 경매 계산에 실패한 회차는 기본 주기 대신 `runtime.errorRetryIntervalSeconds`(기본 60초) 후 재시도합니다. 기본 주기가 더 짧으면 그 주기를 유지합니다. 환경 변수는 `ERROR_RETRY_INTERVAL_SECONDS`입니다. epoch-aware 기능이 꺼져 있거나 epoch이 막 시작한 경우에도 적용됩니다.
+
 실제 bid 변경이 필요한 회차에는 설정 고정값은 빼고, 계산에서 나온 값과 실제 변경될 값만 표로 남깁니다.
 
 ```text
@@ -306,6 +308,9 @@ BID_BOT_CONFIG=/path/to/my-bid-bot.json node bid-bot.js --dry-run
     // epoch 종료가 아직 멀 때 사용하는 기본 주기. 3600 = 1시간.
     "loopInterval": 3600,
 
+    // 데이터 조회/계산 실패 시 재시도 간격. 기본 주기보다 길게 기다리지 않음.
+    "errorRetryIntervalSeconds": 60,
+
     "epochAware": {
       // true면 Solana epoch 남은 시간을 보고 loop 주기를 자동 조정.
       // 기본값 true. RPC 조회 실패 시에는 loopInterval을 그대로 사용.
@@ -409,7 +414,7 @@ receivers = validators
 1. ds-sam 환경 체크 → 없으면 자동 설치
 2. bonds.json fetch 및 내 bid on-chain 조회 (API 반영이 늦어도 내 cpmpe는 온체인 값 사용)
 3. 공식 auction-config 및 나머지 입력 fetch (24h 캐시, epoch 변경 시 갱신)
-4. 빌드된 ds-sam CLI 실행 → 새 결과 생성과 live bonds epoch 일치 검증 후 결과 교체
+4. 입력 epoch 검증 → live bonds epoch을 임시 config로 전달해 ds-sam CLI 실행 → 새 결과 생성과 epoch 일치 검증 후 결과 교체
 5. results.json에서 내 validator 추출
 6. 모드별 처리
    - --status: 내 validator JSON 출력 후 종료
@@ -495,6 +500,14 @@ node bid-bot.js --dry-run --force-refresh
 ```
 
 새 결과의 epoch과 입찰가를 확인한 뒤 운영 PM2/loop를 재시작합니다. `validator-bonds` CLI만 업데이트해도 ds-sam SDK는 자동으로 업데이트되지 않습니다.
+
+**epoch 전환 직후 `계산 epoch(E-1)과 live bonds epoch(E)이 다릅니다`로 중단됨**
+
+ds-sam 0.6.6은 `rewards_inflation_est`의 최신 epoch + 1을 경매 epoch으로 사용합니다. bonds가 E로 넘어간 뒤 rewards가 아직 E-2까지 제공되면, 보조 데이터를 다시 받아도 계산 epoch은 E-1로 남습니다.
+
+봇은 SDK data-provider를 자동 패치/빌드하고, 매 실행의 임시 config에 `bidBotAuctionEpoch`을 넣어 계산 시작부터 live bonds epoch을 사용합니다. 현재 epoch의 `slots_per_year`로 보상도 정규화하며, 결과 JSON의 epoch만 바꾸지 않습니다. validator 데이터의 최신 epoch이 live bonds와 같고 현재 epoch의 `slots_per_year`가 유효하며 inflation rewards가 E-1 또는 E-2까지 있을 때만 계산합니다. 더 오래된 rewards, 미래 rewards, 불일치하는 validator 데이터는 차단합니다. E-2로 계산한 뒤에는 24시간 TTL이 남아 있어도 다음 회차에 보조 데이터를 다시 받아 E-1 보상을 반영합니다. 원본 cache는 계산용 epoch이나 bid override로 수정하지 않습니다.
+
+기존 loop를 중지한 뒤 `node bid-bot.js --dry-run --force-refresh`로 확인하고 `node bid-bot.js --loop`로 재시작하세요. 최초 실행에서 SDK 패치와 재빌드가 자동으로 진행됩니다. 입력 검증이나 계산에 실패하면 loop는 기본 60초 후 재시도합니다.
 
 **"validator가 결과에 없음"**
 - vote account가 Marinade validator 목록에 있는지 먼저 확인

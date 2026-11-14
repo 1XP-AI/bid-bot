@@ -41,6 +41,7 @@
     "_comment": "처음에는 dryRun=true로 로그만 확인하고, 충분히 검증한 뒤 false로 바꾸세요.",
     "dryRun": true,
     "loopInterval": 3600,
+    "errorRetryIntervalSeconds": 60,
     "epochAware": {
       "enabled": true,
       "thresholdSeconds": 3600,

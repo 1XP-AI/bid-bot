@@ -29,6 +29,7 @@ import {
   isSupportedDsSamVersion,
   parseCpmpeBid,
   patchDsSamSdkForPrereleaseVersions,
+  patchDsSamDataProviderForLiveEpoch,
   pmpeToCpmpeLamports,
   readOptionalNumberArg,
   refreshHeavyFiles,
@@ -41,6 +42,7 @@ import {
   shouldRefreshHeavyInputs,
   shouldRunMain,
   validateDsSamResult,
+  validateDsSamInputs,
   withOnchainBid,
 } from '../bid-bot.js';
 
@@ -291,6 +293,22 @@ test('epoch-aware loop switches from base interval to fast interval near epoch e
     delayMs: 3_600_000,
     fastMode: false,
   });
+});
+
+test('failed loops retry quickly after epoch rollover even when epoch-aware mode is disabled', () => {
+  for (const enabled of [true, false]) {
+    assert.equal(chooseLoopDelayMs(null, {
+      enabled, failed: true, loopIntervalMs: 900_000, errorRetryIntervalMs: 60_000,
+    }).delayMs, 60_000);
+    assert.equal(chooseLoopDelayMs(null, {
+      enabled, failed: true, loopIntervalMs: 30_000, errorRetryIntervalMs: 60_000,
+    }).delayMs, 30_000);
+  }
+  for (const invalid of [0, -1, NaN, Infinity]) {
+    assert.equal(chooseLoopDelayMs(null, {
+      failed: true, loopIntervalMs: 900_000, errorRetryIntervalMs: invalid,
+    }).delayMs, 60_000);
+  }
 });
 
 test('human-readable duration keeps hour and minute boundaries stable', () => {
@@ -607,12 +625,22 @@ test('Discord fill-rank messages wrap fixed-width tables in code blocks', () => 
   assert.match(message, /\n```$/);
 });
 
-test('heavy inputs refresh when live bonds epoch differs from last ds-sam result epoch', () => {
+function writeEpochInputs(cacheDir, epoch) {
+  writeFileSync(join(cacheDir, 'config.json'), '{}');
+  writeFileSync(join(cacheDir, 'validators.json'), JSON.stringify({ validators: [{ epoch_stats: [{ epoch }] }] }));
+  writeFileSync(join(cacheDir, 'rewards.json'), JSON.stringify({
+    rewards_inflation_est: [[epoch - 1, 100]], slots_per_year: [[epoch, 78_840_000]],
+  }));
+}
+
+test('heavy inputs refresh when live bonds epoch differs from last ds-sam result epoch', t => {
   const root = mkdtempSync(join(tmpdir(), 'bid-bot-cache-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
   const cacheDir = join(root, 'cache');
   const outputDir = join(root, 'output');
   mkdirSync(cacheDir);
   mkdirSync(outputDir);
+  writeEpochInputs(cacheDir, 982);
   writeFileSync(join(cacheDir, 'bonds.json'), JSON.stringify({ bonds: [{ epoch: 982 }] }));
   writeFileSync(join(outputDir, 'results.json'), JSON.stringify({ auctionData: { epoch: 981 } }));
 
@@ -630,12 +658,14 @@ test('heavy inputs refresh when live bonds epoch differs from last ds-sam result
   assert.deepEqual(status.reasons, ['epoch 981 -> 982']);
 });
 
-test('heavy inputs stay cached when live bonds epoch matches last ds-sam result epoch', () => {
+test('heavy inputs stay cached when live bonds epoch matches last ds-sam result epoch', t => {
   const root = mkdtempSync(join(tmpdir(), 'bid-bot-cache-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
   const cacheDir = join(root, 'cache');
   const outputDir = join(root, 'output');
   mkdirSync(cacheDir);
   mkdirSync(outputDir);
+  writeEpochInputs(cacheDir, 982);
   writeFileSync(join(cacheDir, 'bonds.json'), JSON.stringify({ bonds: [{ epoch: 982 }] }));
   writeFileSync(join(outputDir, 'results.json'), JSON.stringify({ auctionData: { epoch: 982 } }));
 
@@ -660,6 +690,10 @@ function auctionRunFixture(t) {
   mkdirSync(cacheDir);
   mkdirSync(outputDir);
   writeFileSync(join(cacheDir, 'bonds.json'), JSON.stringify({ bonds: [{ epoch: 1074 }] }));
+  for (const file of ['mev-info.json', 'tvl-info.json', 'blacklist.csv', 'auctions.json']) {
+    writeFileSync(join(cacheDir, file), '{}');
+  }
+  writeEpochInputs(cacheDir, 1074);
   const previous = JSON.stringify({ auctionData: { epoch: 1065 } });
   writeFileSync(join(outputDir, 'results.json'), previous);
   const messages = [];
@@ -731,8 +765,74 @@ test('ds-sam nonzero exit cannot publish output even when the epoch matches', t 
 
 test('ds-sam does not run when the live bonds epoch is unavailable', t => {
   const f = auctionRunFixture(t);
-  writeFileSync(join(f.cacheDir, 'bonds.json'), '{}');
-  assert.equal(runDsSam({ ...f, runner: () => assert.fail('must not run without a live epoch') }), false);
+  for (const bonds of [undefined, [], [{ epoch: null }], [{ epoch: '' }], [{ epoch: 1074 }, { epoch: 1073 }]]) {
+    writeFileSync(join(f.cacheDir, 'bonds.json'), JSON.stringify({ bonds }));
+    assert.equal(runDsSam({ ...f, runner: () => assert.fail('must not run without a single live epoch') }), false);
+  }
+});
+
+test('rollover uses the live epoch before running the SDK while preserving source data', t => {
+  const f = auctionRunFixture(t);
+  const rewards = { rewards_inflation_est: [[1072, 100]], slots_per_year: [[1074, 78_840_000]] };
+  writeFileSync(join(f.cacheDir, 'rewards.json'), JSON.stringify(rewards));
+  assert.equal(runDsSam({
+    ...f,
+    runner: (command, args) => {
+      const inputsDir = args[args.indexOf('--cache-dir-path') + 1];
+      const config = JSON.parse(readFileSync(join(inputsDir, 'config.json')));
+      assert.equal(config.bidBotAuctionEpoch, 1074);
+      assert.deepEqual(JSON.parse(readFileSync(join(inputsDir, 'rewards.json'))), rewards);
+      f.result.auctionData.epoch = config.bidBotAuctionEpoch;
+      writeFileSync(join(args[args.indexOf('-o') + 1], 'results.json'), JSON.stringify(f.result));
+      return { status: 0 };
+    },
+  }), true);
+  assert.deepEqual(JSON.parse(readFileSync(join(f.cacheDir, 'config.json'))), {});
+  assert.deepEqual(JSON.parse(readFileSync(join(f.cacheDir, 'rewards.json'))), rewards);
+  assert.deepEqual(readdirSync(f.outputDir), ['results.json']);
+  assert.match(f.messages.join('\n'), /rewards.*1072.*지연/);
+  const status = shouldRefreshHeavyInputs({ cacheDir: f.cacheDir, outputDir: f.outputDir });
+  assert.equal(status.epochChanged, false);
+  assert.equal(status.rewardsLagging, true);
+  assert.equal(status.refresh, true);
+});
+
+test('invalid reward windows cannot run the SDK or replace the last successful auction', t => {
+  const f = auctionRunFixture(t);
+  for (const records of [[], [[1071, 100]], [[1074, 100]], [[null, 100]], [[1073, null]], [[1073, 0]]]) {
+    writeFileSync(join(f.cacheDir, 'rewards.json'), JSON.stringify({
+      rewards_inflation_est: records, slots_per_year: [[1074, 78_840_000]],
+    }));
+    assert.equal(runDsSam({ ...f, runner: () => assert.fail('invalid inputs must not run') }), false);
+    assert.equal(readFileSync(join(f.outputDir, 'results.json'), 'utf8'), f.previous);
+  }
+});
+
+test('rollover requires current validator statistics and the current slots-per-year regime', t => {
+  const f = auctionRunFixture(t);
+  assert.equal(validateDsSamInputs(f.cacheDir, 1074), null);
+  for (const validators of [null, [], [null], [{ epoch_stats: {} }], [{ epoch_stats: [null] }]]) {
+    writeFileSync(join(f.cacheDir, 'validators.json'), JSON.stringify({ validators }));
+    assert.match(validateDsSamInputs(f.cacheDir, 1074), /validator/);
+  }
+  writeFileSync(join(f.cacheDir, 'validators.json'), JSON.stringify({ validators: [{ epoch_stats: [{ epoch: 1073 }] }] }));
+  assert.match(validateDsSamInputs(f.cacheDir, 1074), /validator/);
+  writeFileSync(join(f.cacheDir, 'validators.json'), JSON.stringify({ validators: [{ epoch_stats: [{ epoch: 1074 }] }] }));
+  for (const slots_per_year of [undefined, [], [[1073, 78_840_000]], [[1074, null]], [[1074, 0]]]) {
+    writeFileSync(join(f.cacheDir, 'rewards.json'), JSON.stringify({ rewards_inflation_est: [[1073, 100]], slots_per_year }));
+    assert.match(validateDsSamInputs(f.cacheDir, 1074), /slots_per_year/);
+  }
+});
+
+test('invalid cached inputs force a refresh even after a successful auction in the same epoch', t => {
+  const f = auctionRunFixture(t);
+  writeFileSync(join(f.outputDir, 'results.json'), JSON.stringify(f.result));
+  writeFileSync(join(f.cacheDir, 'config.json'), 'null');
+  const status = shouldRefreshHeavyInputs({ cacheDir: f.cacheDir, outputDir: f.outputDir });
+  assert.equal(status.epochChanged, false);
+  assert.equal(status.refresh, true);
+  assert.equal(status.invalidInputs, true);
+  assert.match(validateDsSamInputs(f.cacheDir, 1074), /config/);
 });
 
 test('ds-sam validation rejects null cutoff and malformed bid calculations', t => {
@@ -782,9 +882,6 @@ test('auction inputs use the on-chain bid even when the bonds API still has the 
   const f = auctionRunFixture(t);
   const apiBonds = { bonds: [{ pubkey: 'bond-a', vote_account: 'vote-a', cpmpe: '24200000', epoch: 1074 }] };
   writeFileSync(join(f.cacheDir, 'bonds.json'), JSON.stringify(apiBonds));
-  for (const file of ['config.json', 'validators.json', 'mev-info.json', 'rewards.json', 'tvl-info.json', 'blacklist.csv', 'auctions.json']) {
-    writeFileSync(join(f.cacheDir, file), '{}');
-  }
   assert.equal(runDsSam({
     ...f,
     onchainBond: { bondAccount: 'bond-a', voteAccount: 'vote-a', bid: 0.0249 },
@@ -951,4 +1048,28 @@ test('ds-sam recognizes native prerelease support in the current eligibility mod
     includePrerelease: true,
   })`;
   assert.deepEqual(patchDsSamSdkForPrereleaseVersions(source), { source, patched: false, alreadyPatched: true });
+});
+
+test('live epoch patch changes the epoch used for reward normalization and is idempotent', () => {
+  const source = `const epoch = data.rewards.rewards_inflation_est.reduce((epoch, entry) => Math.max(epoch, entry[0]), 0) + 1
+    const slotParams = { slotsPerYear: this.resolveSlotsPerYear(data.rewards, epoch), epoch }
+    return { epoch, slotParams }`;
+  const patch = patchDsSamDataProviderForLiveEpoch(source);
+  assert.equal(patch.patched, true);
+  const executable = patch.source.replace('(this.config as DsSamConfig & { bidBotAuctionEpoch?: number })', 'this.config');
+  const aggregate = new Function('data', executable);
+  const data = { rewards: { rewards_inflation_est: [[1084, 100]] } };
+  const provider = {
+    config: { bidBotAuctionEpoch: 1086 },
+    resolveSlotsPerYear: (rewards, epoch) => epoch === 1086 ? 100_000_000 : 78_840_000,
+  };
+  assert.deepEqual(aggregate.call(provider, data), {
+    epoch: 1086, slotParams: { slotsPerYear: 100_000_000, epoch: 1086 },
+  });
+  provider.config = {};
+  assert.equal(aggregate.call(provider, data).epoch, 1085);
+  assert.deepEqual(patchDsSamDataProviderForLiveEpoch(patch.source), {
+    source: patch.source, patched: false, alreadyPatched: true,
+  });
+  assert.equal(patchDsSamDataProviderForLiveEpoch('unsupported SDK source').patched, false);
 });

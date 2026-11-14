@@ -98,6 +98,7 @@ const DISCORD_WEBHOOK = get('DISCORD_WEBHOOK', 'logging.discordWebhook', '');
 
 const DRY_RUN       = String(get('DRY_RUN',       'runtime.dryRun', false)).toLowerCase() === 'true';
 const LOOP_INTERVAL = +get('LOOP_INTERVAL', 'runtime.loopInterval', 300) * 1000;
+const ERROR_RETRY_INTERVAL = +get('ERROR_RETRY_INTERVAL_SECONDS', 'runtime.errorRetryIntervalSeconds', 60) * 1000;
 const DSSAM_TIMEOUT_MS = +get('DSSAM_TIMEOUT_MS', 'runtime.dsSamTimeoutMs', 5 * 60 * 1000);
 const BOND_CLI_TIMEOUT_MS = +get('BOND_CLI_TIMEOUT_MS', 'runtime.bondCliTimeoutMs', 60 * 1000);
 const SETUP_COMMAND_TIMEOUT_MS = +get('SETUP_COMMAND_TIMEOUT_MS', 'runtime.setupCommandTimeoutMs', 15 * 60 * 1000);
@@ -492,19 +493,39 @@ function patchDsSamSdkForPrereleaseVersions(source) {
     alreadyPatched: false,
   };
 }
+function patchDsSamDataProviderForLiveEpoch(source) {
+  const marker = '(this.config as DsSamConfig & { bidBotAuctionEpoch?: number }).bidBotAuctionEpoch';
+  if (source.includes(marker)) return { source, patched: false, alreadyPatched: true };
+  const target = 'const epoch = data.rewards.rewards_inflation_est.reduce((epoch, entry) => Math.max(epoch, entry[0]), 0) + 1';
+  if (!source.includes(target)) return { source, patched: false, alreadyPatched: false };
+  return {
+    source: source.replace(target, `const epoch = ${marker}\n      ?? (data.rewards.rewards_inflation_est.reduce((epoch, entry) => Math.max(epoch, entry[0]), 0) + 1)`),
+    patched: true,
+    alreadyPatched: false,
+  };
+}
 function applyDsSamCompatibilityPatches() {
+  const providerPath = `${DSSAM_DIR}/packages/ds-sam-sdk/src/data-provider/data-provider.ts`;
+  const epochPatch = patchDsSamDataProviderForLiveEpoch(readFileSync(providerPath, 'utf8'));
+  if (!epochPatch.patched && !epochPatch.alreadyPatched) {
+    throw new Error('ds-sam live epoch 패치를 적용하지 못했습니다. SDK data-provider 버전을 확인하세요.');
+  }
+  if (epochPatch.patched) {
+    writeFileSync(providerPath, epochPatch.source);
+    log('ds-sam이 rewards 반영 지연과 관계없이 검증된 live bonds epoch으로 계산하도록 패치했습니다.');
+  }
   const eligibilityPath = `${DSSAM_DIR}/packages/ds-sam-sdk/src/eligibility.ts`;
   const sdkPath = existsSync(eligibilityPath)
     ? eligibilityPath
     : `${DSSAM_DIR}/packages/ds-sam-sdk/src/sdk.ts`;
-  if (!existsSync(sdkPath)) return false;
+  if (!existsSync(sdkPath)) return epochPatch.patched;
   const original = readFileSync(sdkPath, 'utf8');
   const result = patchDsSamSdkForPrereleaseVersions(original);
   if (!result.patched) {
     if (!result.alreadyPatched) {
       log('⚠️ ds-sam client version 체크 패치를 적용하지 못했습니다. Firedancer rc 버전이 SAM eligibility에서 제외될 수 있습니다.');
     }
-    return false;
+    return epochPatch.patched;
   }
   writeFileSync(sdkPath, result.source);
   log('ds-sam client version 체크를 Firedancer rc 버전까지 허용하도록 패치했습니다.');
@@ -521,9 +542,10 @@ function readJsonFile(file) {
 }
 function extractBondsEpoch(data) {
   const bonds = Array.isArray(data) ? data : data?.bonds;
-  if (!Array.isArray(bonds)) return null;
-  const epochs = bonds.map(row => Number(row?.epoch)).filter(Number.isFinite);
-  return epochs.length > 0 ? Math.max(...epochs) : null;
+  if (!Array.isArray(bonds) || bonds.length === 0) return null;
+  const epochs = bonds.map(row => row?.epoch == null || row.epoch === '' ? NaN : Number(row.epoch));
+  if (!epochs.every(epoch => Number.isSafeInteger(epoch) && epoch >= 0)) return null;
+  return epochs.every(epoch => epoch === epochs[0]) ? epochs[0] : null;
 }
 function readCachedBondsEpoch(cacheDir = CACHE_DIR) {
   return extractBondsEpoch(readJsonFile(`${cacheDir}/bonds.json`));
@@ -531,6 +553,37 @@ function readCachedBondsEpoch(cacheDir = CACHE_DIR) {
 function readCachedResultsEpoch(outputDir = OUTPUT_DIR) {
   const epoch = readJsonFile(`${outputDir}/results.json`)?.auctionData?.epoch;
   return Number.isFinite(epoch) ? epoch : null;
+}
+function readRewardsEpoch(rewards) {
+  const records = rewards?.rewards_inflation_est;
+  if (!Array.isArray(records) || records.length === 0) return null;
+  if (!records.every(row => Array.isArray(row) && Number.isSafeInteger(row[0]) && row[0] >= 0
+      && Number.isFinite(row[1]) && row[1] > 0)) return null;
+  return Math.max(...records.map(row => row[0]));
+}
+function validateDsSamInputs(cacheDir, expectedEpoch) {
+  const config = readJsonFile(`${cacheDir}/config.json`);
+  if (!config || typeof config !== 'object' || Array.isArray(config)) return 'auction config가 유효하지 않습니다';
+  const rewards = readJsonFile(`${cacheDir}/rewards.json`);
+  const rewardsEpoch = readRewardsEpoch(rewards);
+  // Rewards are historical estimates. At rollover the producer may still be
+  // finalizing E-1; E-2 remains usable, but an older window must fail closed.
+  if (rewardsEpoch == null || rewardsEpoch >= expectedEpoch || rewardsEpoch < expectedEpoch - 2) {
+    return `rewards 최신 epoch(${rewardsEpoch ?? '없음'})이 live bonds epoch(${expectedEpoch})의 직전 1~2 epoch 범위가 아닙니다`;
+  }
+  const validators = readJsonFile(`${cacheDir}/validators.json`)?.validators;
+  const epochs = Array.isArray(validators)
+    ? validators.flatMap(v => Array.isArray(v?.epoch_stats) ? v.epoch_stats.map(s => s?.epoch) : []).filter(Number.isSafeInteger)
+    : [];
+  if (epochs.length === 0 || Math.max(...epochs) !== expectedEpoch) {
+    return `validator 데이터의 최신 epoch이 live bonds epoch(${expectedEpoch})과 다릅니다`;
+  }
+  const slots = rewards?.slots_per_year;
+  const nominal = Array.isArray(slots) ? slots.find(row => row?.[0] === expectedEpoch)?.[1] : null;
+  if (!Number.isFinite(nominal) || nominal <= 0) {
+    return `live bonds epoch(${expectedEpoch})의 slots_per_year가 유효하지 않습니다`;
+  }
+  return null;
 }
 function shouldRefreshHeavyInputs(opts = {}) {
   const force = opts.force ?? false;
@@ -542,10 +595,15 @@ function shouldRefreshHeavyInputs(opts = {}) {
   const bondsEpoch = readCachedBondsEpoch(cacheDir);
   const resultsEpoch = readCachedResultsEpoch(outputDir);
   const epochChanged = bondsEpoch != null && resultsEpoch !== bondsEpoch;
+  const rewardsEpoch = readRewardsEpoch(readJsonFile(`${cacheDir}/rewards.json`));
+  const rewardsLagging = bondsEpoch != null && rewardsEpoch != null && rewardsEpoch < bondsEpoch - 1;
+  const invalidInputs = bondsEpoch != null && validateDsSamInputs(cacheDir, bondsEpoch) != null;
   const reasons = [
     force ? '--force-refresh' : null,
     ttlExpired ? 'cache ttl/missing file' : null,
     epochChanged ? `epoch ${resultsEpoch ?? 'none'} -> ${bondsEpoch}` : null,
+    rewardsLagging ? `rewards epoch ${rewardsEpoch} < ${bondsEpoch - 1}` : null,
+    invalidInputs ? 'invalid auction inputs' : null,
   ].filter(Boolean);
 
   return {
@@ -554,6 +612,8 @@ function shouldRefreshHeavyInputs(opts = {}) {
     force,
     ttlExpired,
     epochChanged,
+    rewardsLagging,
+    invalidInputs,
     bondsEpoch,
     resultsEpoch,
   };
@@ -623,6 +683,11 @@ function chooseLoopDelayMs(timing, opts = {}) {
   const loopIntervalMs = opts.loopIntervalMs ?? LOOP_INTERVAL;
   const fastThresholdSeconds = opts.thresholdSeconds ?? EPOCH_FAST_THRESHOLD_SECONDS;
   const fastIntervalMs = opts.fastLoopIntervalMs ?? EPOCH_FAST_INTERVAL;
+  if (opts.failed) {
+    const configuredRetry = opts.errorRetryIntervalMs ?? ERROR_RETRY_INTERVAL;
+    const retryMs = Number.isFinite(configuredRetry) && configuredRetry > 0 ? configuredRetry : 60_000;
+    return { delayMs: Math.min(loopIntervalMs, retryMs), fastMode: false };
+  }
   if (!epochAwareLoop) return { delayMs: loopIntervalMs, fastMode: false };
   if (timing.remainingSeconds <= fastThresholdSeconds) {
     return { delayMs: Math.min(loopIntervalMs, fastIntervalMs), fastMode: true };
@@ -630,7 +695,12 @@ function chooseLoopDelayMs(timing, opts = {}) {
   return { delayMs: loopIntervalMs, fastMode: false };
 }
 
-async function nextLoopDelayMs() {
+async function nextLoopDelayMs({ failed = false } = {}) {
+  if (failed) {
+    const { delayMs } = chooseLoopDelayMs(null, { failed: true });
+    log(`이번 회차를 완료하지 못해 ${fmtDuration(delayMs / 1000)} 후 다시 시도합니다.`);
+    return delayMs;
+  }
   if (!EPOCH_AWARE_LOOP) return LOOP_INTERVAL;
   try {
     const timing = await getEpochTiming();
@@ -701,7 +771,9 @@ function isSupportedDsSamVersion(version) {
 function ensureDsSamReady() {
   const buildReady = existsSync(`${DSSAM_DIR}/dist/src/cli.js`)
                   && existsSync(`${DSSAM_DIR}/packages/ds-sam-sdk/dist/src/index.js`)
-                  && existsSync(`${DSSAM_DIR}/packages/ds-sam-calc/dist/src/uptime.js`);
+                  && existsSync(`${DSSAM_DIR}/packages/ds-sam-calc/dist/src/uptime.js`)
+                  && existsSync(`${DSSAM_DIR}/packages/ds-sam-sdk/dist/src/data-provider/data-provider.js`)
+                  && readFileSync(`${DSSAM_DIR}/packages/ds-sam-sdk/dist/src/data-provider/data-provider.js`, 'utf8').includes('bidBotAuctionEpoch');
   const need = !existsSync(DSSAM_DIR)
             || !existsSync(`${DSSAM_DIR}/node_modules`)
             || !existsSync(PIPELINE_DIR)
@@ -821,19 +893,30 @@ function runDsSam(opts = {}) {
     logger('❌ 최신 bond 데이터에서 epoch을 확인하지 못해 계산을 중단합니다.');
     return false;
   }
+  const inputError = validateDsSamInputs(cacheDir, expectedEpoch);
+  if (inputError) {
+    logger(`❌ Marinade SAM 입력 검증에 실패했습니다. 이유: ${inputError}`);
+    return false;
+  }
   // nest-commander can report an SDK error and still exit 0. Only a newly
   // produced, validated result may replace the previous successful output.
   const runDir = mkdtempSync(`${outputDir}/.run-`);
   logVerbose('Marinade SAM 경매 계산을 실행합니다.');
   const start = Date.now();
   try {
-    let inputsDir = cacheDir;
+    const inputsDir = `${runDir}/inputs`;
+    mkdirSync(inputsDir);
+    for (const [file] of HEAVY_FILES) copyFileSync(`${cacheDir}/${file}`, `${inputsDir}/${file}`);
+    const config = readJsonFile(`${inputsDir}/config.json`);
+    writeFileSync(`${inputsDir}/config.json`, JSON.stringify({ ...config, bidBotAuctionEpoch: expectedEpoch }));
+    let bonds = readJsonFile(`${cacheDir}/bonds.json`);
     if (opts.onchainBond) {
-      inputsDir = `${runDir}/inputs`;
-      mkdirSync(inputsDir);
-      for (const [file] of HEAVY_FILES) copyFileSync(`${cacheDir}/${file}`, `${inputsDir}/${file}`);
-      const bonds = withOnchainBid(readJsonFile(`${cacheDir}/bonds.json`), opts.onchainBond);
-      writeFileSync(`${inputsDir}/bonds.json`, JSON.stringify(bonds));
+      bonds = withOnchainBid(bonds, opts.onchainBond);
+    }
+    writeFileSync(`${inputsDir}/bonds.json`, JSON.stringify(bonds));
+    const rewardsEpoch = readRewardsEpoch(readJsonFile(`${inputsDir}/rewards.json`));
+    if (rewardsEpoch < expectedEpoch - 1) {
+      logger(`ℹ️ rewards 최신 epoch(${rewardsEpoch}) 반영이 지연되어 있습니다. 최신 validator/slots_per_year를 검증했고 live bonds epoch(${expectedEpoch})으로 계산합니다.`);
     }
     const r = runner(process.execPath, [`${DSSAM_DIR}/dist/src/cli.js`, 'auction',
       '-c',                  `${inputsDir}/config.json`,
@@ -1660,6 +1743,7 @@ export {
   isSupportedDsSamVersion,
   parseCpmpeBid,
   patchDsSamSdkForPrereleaseVersions,
+  patchDsSamDataProviderForLiveEpoch,
   pmpeToCpmpeLamports,
   readOptionalNumberArg,
   refreshHeavyFiles,
@@ -1675,6 +1759,7 @@ export {
   shouldRefreshHeavyInputs,
   shouldRunMain,
   validateDsSamResult,
+  validateDsSamInputs,
   withOnchainBid,
 };
 
@@ -1750,7 +1835,7 @@ async function main() {
           log(`fill-rank Discord 알림 생성에 실패했습니다. 이유: ${e.stack || e.message}`);
         }
       }
-      const delayMs = await nextLoopDelayMs();
+      const delayMs = await nextLoopDelayMs({ failed: !freshResults });
       const loopDelayMs = loopFillRankReports ? Math.min(delayMs, FILL_RANK_DISCORD_CHECK_INTERVAL_MS) : delayMs;
       if (firstLoopRun) {
         log(`첫 회차 확인이 끝났습니다. 다음 확인은 ${fmtDuration(loopDelayMs / 1000)} 후입니다.`);
