@@ -113,6 +113,8 @@ const FILL_RANK_DISCORD_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 const FILL_RANK_MIN_STAKE_DELTA_SOL = +get('FILL_RANK_MIN_STAKE_DELTA_SOL', 'runtime.fillRankChange.minStakeDeltaSol', 1000);
 const FILL_RANK_MIN_BID_DELTA_PMPE = +get('FILL_RANK_MIN_BID_DELTA_PMPE', 'runtime.fillRankChange.minBidDeltaPmpe', 0.0005);
 const FILL_RANK_MIN_FILL_PCT_DELTA = +get('FILL_RANK_MIN_FILL_PCT_DELTA', 'runtime.fillRankChange.minFillPctDelta', 0.01);
+const BOND_RUNWAY_ALERT_ENABLED = String(get('BOND_RUNWAY_ALERT_ENABLED', 'runtime.bondRunwayAlert.enabled', true)).toLowerCase() === 'true';
+const BOND_RUNWAY_ALERT_THRESHOLD_EPOCHS = +get('BOND_RUNWAY_ALERT_THRESHOLD_EPOCHS', 'runtime.bondRunwayAlert.thresholdEpochs', 10);
 
 function resolveMode(argv) {
   if (argv.includes('--setup')) return 'setup';
@@ -411,16 +413,24 @@ async function initDiscordValidatorLabel() {
   }
 }
 
-async function notifyDiscord(content) {
-  if (!DISCORD_WEBHOOK) return;
+async function notifyDiscord(content, opts = {}) {
+  const webhook = opts.webhook ?? DISCORD_WEBHOOK;
+  const request = opts.fetchImpl ?? fetch;
+  const logger = opts.logger ?? log;
+  if (!webhook) return false;
   try {
-    const resp = await fetch(DISCORD_WEBHOOK, {
+    const resp = await request(webhook, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content: formatDiscordContent(content) }),
+      signal: AbortSignal.timeout(10000),
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${(await resp.text()).slice(0, 500)}`);
-  } catch (e) { log(`Discord 알림을 보내지 못했습니다. 이유: ${e.message}`); }
+    return true;
+  } catch (e) {
+    logger(`Discord 알림을 보내지 못했습니다. 이유: ${e.message}`);
+    return false;
+  }
 }
 
 async function notifyDiscordImage(content, filename, imageBuffer, mimeType = 'image/png') {
@@ -539,6 +549,18 @@ function readJsonFile(file) {
   if (!existsSync(file)) return null;
   try { return JSON.parse(readFileSync(file, 'utf8')); }
   catch { return null; }
+}
+function updateState(patch, stateFile = STATE_FILE) {
+  const previous = readJsonFile(stateFile);
+  const state = { ...(previous && typeof previous === 'object' && !Array.isArray(previous) ? previous : {}), ...patch };
+  const temporary = `${stateFile}.${process.pid}.tmp`;
+  try {
+    writeFileSync(temporary, JSON.stringify(state, null, 2));
+    renameSync(temporary, stateFile);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+  return state;
 }
 function extractBondsEpoch(data) {
   const bonds = Array.isArray(data) ? data : data?.bonds;
@@ -993,10 +1015,26 @@ function extractMyStatus() {
   const f = `${OUTPUT_DIR}/results.json`;
   if (!existsSync(f)) return null;
   const data = JSON.parse(readFileSync(f, 'utf8'));
-  return extractMyStatusFromResults(data, VOTE_ADDR);
+  return extractMyStatusFromResults(data, VOTE_ADDR, readJsonFile(`${CACHE_DIR}/config.json`) ?? {});
 }
 
-function extractMyStatusFromResults(data, voteAccount) {
+function extractBondRunwayEpochs(validator, config = {}) {
+  const minBondBalanceSol = config.minBondBalanceSol ?? 7;
+  const balance = validator.bondBalanceSol;
+  if (balance === null || (Number.isFinite(balance) && balance < minBondBalanceSol)) return 0;
+  const runway = validator.bondGoodForNEpochs;
+  if (Number.isFinite(runway)) return Math.max(0, runway);
+  if (runway === Infinity) return Infinity;
+  // JSON serializes the SDK's unlimited runway as null. Missing/invalid data
+  // must stay unknown instead of producing a false "0 epochs" warning.
+  if (runway === null && Number.isFinite(balance) && balance >= minBondBalanceSol
+      && (validator.marinadeActivatedStakeSol === 0 || validator.revShare?.expectedMaxEffBidPmpe === 0)) {
+    return Infinity;
+  }
+  return null;
+}
+
+function extractMyStatusFromResults(data, voteAccount, config = {}) {
   const me = data.auctionData?.validators?.find(v => v.voteAccount === voteAccount);
   if (!me) return null;
   return {
@@ -1012,9 +1050,67 @@ function extractMyStatusFromResults(data, voteAccount) {
     samTargetSol:        me.auctionStake?.marinadeSamTargetSol ?? 0,
     marinadeStakeSol:    me.marinadeActivatedStakeSol,
     bondBalanceSol:      me.bondBalanceSol,
+    bondRunwayEpochs:    extractBondRunwayEpochs(me, config),
     samEligible:         me.samEligible,
     lastCapConstraint:   me.lastCapConstraint?.constraintType ?? null,
   };
+}
+
+async function checkBondRunwayAlert(status, opts = {}) {
+  const enabled = opts.enabled ?? BOND_RUNWAY_ALERT_ENABLED;
+  const threshold = opts.thresholdEpochs ?? BOND_RUNWAY_ALERT_THRESHOLD_EPOCHS;
+  const stateFile = opts.stateFile ?? STATE_FILE;
+  const notifier = opts.notifier ?? notifyDiscord;
+  const logger = opts.logger ?? log;
+  const dryRun = opts.dryRun ?? dryRunActive;
+  const runway = status.bondRunwayEpochs;
+  if (!enabled || !Number.isFinite(threshold) || threshold < 0) return false;
+  if ((!Number.isFinite(runway) && runway !== Infinity)
+      || !Number.isSafeInteger(status.epoch) || !status.voteAccount) return false;
+
+  try {
+    const state = readJsonFile(stateFile) ?? {};
+    const saved = state.bond_runway_alert;
+    const previous = saved?.vote_account === status.voteAccount ? saved : null;
+    if (runway > threshold) {
+      if (previous?.active && !dryRun) {
+        updateState({ bond_runway_alert: { ...previous, active: false } }, stateFile);
+      }
+      return false;
+    }
+    if (previous?.active && previous.last_alert_epoch === status.epoch
+        && previous.threshold_epochs === threshold) return false;
+
+    const message = `⚠️ \`bid-bot\`: Bond runway가 ${threshold}에폭 이하입니다.\n`
+      + `현재 runway: ${runway.toFixed(2)} 에폭\n`
+      + `Bond 잔액: ${fmtSol(status.bondBalanceSol)}\n`
+      + `활성 stake: ${fmtSol(status.marinadeStakeSol)}\n`
+      + `Epoch: ${status.epoch}\nBond 충전을 확인해 주세요.`;
+    if (dryRun) {
+      logger(`DRY_RUN: Discord로 보낼 bond runway 경고:\n${message}`);
+      return false;
+    }
+    logger(`⚠️ Bond runway ${runway.toFixed(2)} 에폭이 기준 ${threshold} 에폭 이하입니다.`);
+    if (!(await notifier(message))) {
+      logger('Bond runway 경고를 전송하지 못했습니다. webhook 설정과 연결을 확인하세요. 다음 회차에서 다시 시도합니다.');
+      return false;
+    }
+    updateState({
+      bond_runway_alert: {
+        vote_account: status.voteAccount,
+        active: true,
+        last_alert_epoch: status.epoch,
+        last_alert_at: new Date().toISOString(),
+        runway_epochs: runway,
+        threshold_epochs: threshold,
+      },
+    }, stateFile);
+    logger('Bond runway 경고를 Discord로 전송했습니다.');
+    return true;
+  } catch (e) {
+    logger(`Bond runway 알림 처리에 실패했습니다. 다음 회차에서 다시 확인합니다. 이유: ${e.message}`);
+    return false;
+  }
 }
 
 function computeFillRankRowsFromResults(data, opts = {}) {
@@ -1622,6 +1718,8 @@ async function runOnce() {
     return true;
   }
 
+  await checkBondRunwayAlert(status);
+
   // samEligible 체크는 비활성화되었습니다 (사용자 요청).
   if (!status.samEligible) {
     log('ℹ️ samEligible=false 이지만 체크를 건너뛰고 진행합니다.');
@@ -1697,9 +1795,9 @@ async function runOnce() {
   if (applyBid(bondAccount, target, onchain.bid)) {
     if (dryRunActive) return true;
     await notifyDiscord(`✅ \`bid-bot\`: on-chain bid를 ${fmtPmpe(onchain.bid)}에서 ${fmtPmpe(target)}로 변경했습니다. epoch ${status.epoch}, 참여 bid ${fmtPmpe(status.effPart)}.`);
-    writeFileSync(STATE_FILE, JSON.stringify({
+    updateState({
       last_bid: target, last_change_at: new Date().toISOString(), epoch: status.epoch,
-    }, null, 2));
+    });
   } else {
     await notifyDiscord('❌ `bid-bot`: on-chain bid 변경에 실패했습니다.');
   }
@@ -1725,11 +1823,13 @@ export {
   buildConfigureBondArgs,
   calculateEpochTiming,
   capSingleDrop,
+  checkBondRunwayAlert,
   chooseLoopDelayMs,
   computeFillRankRowsFromResults,
   computeRecentMinFloor,
   computeTargetBid,
   extractMyEffBidsFromAuctions,
+  extractBondRunwayEpochs,
   extractMyStatusFromResults,
   findValidatorNameByVoteAccount,
   formatDiscordCodeBlockMessages,
@@ -1741,6 +1841,7 @@ export {
   fmtDuration,
   isTargetInSanityRange,
   isSupportedDsSamVersion,
+  notifyDiscord,
   parseCpmpeBid,
   patchDsSamSdkForPrereleaseVersions,
   patchDsSamDataProviderForLiveEpoch,
@@ -1758,6 +1859,7 @@ export {
   shouldCheckScheduledFillRankReport,
   shouldRefreshHeavyInputs,
   shouldRunMain,
+  updateState,
   validateDsSamResult,
   validateDsSamInputs,
   withOnchainBid,

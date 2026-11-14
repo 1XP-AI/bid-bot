@@ -10,6 +10,7 @@ Marinade SAM 자동 bid 관리 봇. 로컬에서 ds-sam SDK를 직접 실행해 
 - **PM2 통합**: 상시 실행 + epoch 임박 시 빠른 체크
 - **bond account 자동 resolve**: vote account에서 bond account를 derive하거나 설정값 사용
 - **Discord webhook**: 변경 시 알림
+- **Bond runway 경고**: runway 10에폭 이하 감지 및 에폭당 한 번 재알림
 - **DRY_RUN 모드**: 실전 적용 전 안전 검증
 
 ## 전제 조건
@@ -145,6 +146,25 @@ Rank  Vote              Stake   Target   Active  받을 Stake  Fill 예상  Fill
    2  2wUhcn...acLc        17   25,000        0      25,000     25,000  100%  0.2510  0.2664
    3  HHLMTH...ubgq        24  300,000  166,370     133,630     31,948   24%  0.1510  0.1664
 ```
+
+### Bond runway 알림
+
+일반 실행과 `--loop`는 ds-sam이 계산한 bond runway가 **10에폭 이하**이면 기존 Discord webhook으로 경고를 보냅니다. `--status` JSON의 `bondRunwayEpochs`에서도 현재 값을 확인할 수 있습니다. 기준값은 SDK의 `bondGoodForNEpochs`이며, bond 잔액이 SDK 최소 기준 미만이면 runway를 0으로 취급합니다.
+
+처음 낮은 상태를 감지하면 한 번 보내고, 계속 낮으면 에폭당 한 번만 재알림합니다. 10에폭을 초과해 회복한 뒤 다시 떨어지면 같은 에폭에서도 새 경고를 보냅니다. 전송 성공 기록은 `logging.stateFile`에 bid 변경 기록과 함께 보관하므로 프로세스를 재시작해도 같은 에폭의 경고를 반복하지 않습니다. 전송 실패 시에는 기록을 소비하지 않고 다음 회차에 재시도합니다.
+
+bid 변경이 없거나 수동 floor가 안전 범위를 벗어나 자동 입찰을 건너뛰어도 runway 검사는 수행합니다. `--dry-run`은 경고를 로그로 미리 보여주며 전송하거나 알림 상태를 변경하지 않습니다. `--status`와 단독 `--fill-rank`는 runway 경고를 전송하지 않습니다.
+
+별도 설정 없이 기본값으로 활성화됩니다. 필요하면 `bid-bot.json`의 `runtime` 안에 추가할 수 있습니다.
+
+```json
+"bondRunwayAlert": {
+  "enabled": true,
+  "thresholdEpochs": 10
+}
+```
+
+환경 변수 `BOND_RUNWAY_ALERT_ENABLED`, `BOND_RUNWAY_ALERT_THRESHOLD_EPOCHS`로도 지정할 수 있습니다. 코드나 설정을 바꾼 뒤에는 실행 중인 loop를 재시작해야 합니다.
 
 ### 5. PM2로 자동화
 
@@ -310,6 +330,12 @@ BID_BOT_CONFIG=/path/to/my-bid-bot.json node bid-bot.js --dry-run
 
     // 데이터 조회/계산 실패 시 재시도 간격. 기본 주기보다 길게 기다리지 않음.
     "errorRetryIntervalSeconds": 60,
+
+    "bondRunwayAlert": {
+      // Bond runway가 이 값 이하이면 Discord 경고 (기본 활성화).
+      "enabled": true,
+      "thresholdEpochs": 10
+    },
 
     "epochAware": {
       // true면 Solana epoch 남은 시간을 보고 loop 주기를 자동 조정.
