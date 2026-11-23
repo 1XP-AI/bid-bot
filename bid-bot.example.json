@@ -41,7 +41,7 @@
     "_comment": "처음에는 dryRun=true로 로그만 확인하고, 충분히 검증한 뒤 false로 바꾸세요.",
     "dryRun": true,
     "loopInterval": 3600,
-    "errorRetryIntervalSeconds": 60,
+    "errorRetryIntervalSeconds": 900,
     "bondRunwayAlert": {
       "_comment": "Bond runway가 thresholdEpochs 이하이면 Discord 경고. 낮은 상태가 계속되면 에폭당 한 번 재알림.",
       "enabled": true,

@@ -98,7 +98,7 @@ const DISCORD_WEBHOOK = get('DISCORD_WEBHOOK', 'logging.discordWebhook', '');
 
 const DRY_RUN       = String(get('DRY_RUN',       'runtime.dryRun', false)).toLowerCase() === 'true';
 const LOOP_INTERVAL = +get('LOOP_INTERVAL', 'runtime.loopInterval', 300) * 1000;
-const ERROR_RETRY_INTERVAL = +get('ERROR_RETRY_INTERVAL_SECONDS', 'runtime.errorRetryIntervalSeconds', 60) * 1000;
+const ERROR_RETRY_INTERVAL = +get('ERROR_RETRY_INTERVAL_SECONDS', 'runtime.errorRetryIntervalSeconds', 900) * 1000;
 const DSSAM_TIMEOUT_MS = +get('DSSAM_TIMEOUT_MS', 'runtime.dsSamTimeoutMs', 5 * 60 * 1000);
 const BOND_CLI_TIMEOUT_MS = +get('BOND_CLI_TIMEOUT_MS', 'runtime.bondCliTimeoutMs', 60 * 1000);
 const SETUP_COMMAND_TIMEOUT_MS = +get('SETUP_COMMAND_TIMEOUT_MS', 'runtime.setupCommandTimeoutMs', 15 * 60 * 1000);
@@ -707,8 +707,8 @@ function chooseLoopDelayMs(timing, opts = {}) {
   const fastIntervalMs = opts.fastLoopIntervalMs ?? EPOCH_FAST_INTERVAL;
   if (opts.failed) {
     const configuredRetry = opts.errorRetryIntervalMs ?? ERROR_RETRY_INTERVAL;
-    const retryMs = Number.isFinite(configuredRetry) && configuredRetry > 0 ? configuredRetry : 60_000;
-    return { delayMs: Math.min(loopIntervalMs, retryMs), fastMode: false };
+    const retryMs = Number.isFinite(configuredRetry) && configuredRetry > 0 ? configuredRetry : 900_000;
+    return { delayMs: retryMs, fastMode: false };
   }
   if (!epochAwareLoop) return { delayMs: loopIntervalMs, fastMode: false };
   if (timing.remainingSeconds <= fastThresholdSeconds) {

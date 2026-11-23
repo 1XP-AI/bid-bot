@@ -297,19 +297,22 @@ test('epoch-aware loop switches from base interval to fast interval near epoch e
   });
 });
 
-test('failed loops retry quickly after epoch rollover even when epoch-aware mode is disabled', () => {
+test('failed loops retry every 15 minutes independently of normal and epoch-aware intervals', () => {
   for (const enabled of [true, false]) {
-    assert.equal(chooseLoopDelayMs(null, {
-      enabled, failed: true, loopIntervalMs: 900_000, errorRetryIntervalMs: 60_000,
-    }).delayMs, 60_000);
-    assert.equal(chooseLoopDelayMs(null, {
-      enabled, failed: true, loopIntervalMs: 30_000, errorRetryIntervalMs: 60_000,
-    }).delayMs, 30_000);
+    for (const loopIntervalMs of [30_000, 300_000, 900_000, 3_600_000]) {
+      assert.equal(chooseLoopDelayMs({ remainingSeconds: 30 }, {
+        enabled, failed: true, loopIntervalMs, fastLoopIntervalMs: 300_000, errorRetryIntervalMs: 900_000,
+      }).delayMs, 900_000);
+    }
   }
+  assert.equal(chooseLoopDelayMs(null, { failed: true }).delayMs, 900_000);
+  assert.equal(chooseLoopDelayMs(null, {
+    failed: true, errorRetryIntervalMs: 120_000,
+  }).delayMs, 120_000);
   for (const invalid of [0, -1, NaN, Infinity]) {
     assert.equal(chooseLoopDelayMs(null, {
       failed: true, loopIntervalMs: 900_000, errorRetryIntervalMs: invalid,
-    }).delayMs, 60_000);
+    }).delayMs, 900_000);
   }
 });
 
